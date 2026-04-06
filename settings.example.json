@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"CLAUDE_DIR/scripts/hooks/deny-destructive.js\""
+          }
+        ],
+        "description": "Block destructive commands (rm -rf /, sudo, force push, etc.)",
+        "id": "pre:bash:deny-destructive"
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"CLAUDE_DIR/scripts/hooks/network-egress.js\""
+          }
+        ],
+        "description": "Block outbound network requests to domains not in allowlist",
+        "id": "pre:bash:network-egress"
+      }
+    ]
+  }
+}

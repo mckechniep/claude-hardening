@@ -1,0 +1,21 @@
+{
+  "allowedDomains": [
+    "github.com",
+    "api.github.com",
+    "raw.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "registry.npmjs.org",
+    "pypi.org",
+    "crates.io",
+    "rubygems.org",
+    "pkg.go.dev",
+    "proxy.golang.org",
+    "cdn.jsdelivr.net",
+    "unpkg.com",
+    "dl.google.com",
+    "storage.googleapis.com",
+    "api.anthropic.com"
+  ],
+  "allowLocalhost": true,
+  "warnOnVariableUrls": true
+}
