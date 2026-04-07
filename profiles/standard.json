@@ -1,4 +1,5 @@
 {
+  "_comment": "Standard profile — all security hooks enabled. Good default for most development work.",
   "hooks": {
     "PreToolUse": [
       {
@@ -20,7 +21,7 @@
             "command": "node \"CLAUDE_DIR/scripts/hooks/network-egress.js\""
           }
         ],
-        "description": "Block outbound network requests to domains not in allowlist",
+        "description": "Block outbound network to domains not in allowlist",
         "id": "pre:bash:network-egress"
       },
       {
@@ -53,7 +54,7 @@
             "command": "node \"CLAUDE_DIR/scripts/hooks/secret-scan.js\""
           }
         ],
-        "description": "Block writes containing credential patterns (API keys, tokens, private keys)",
+        "description": "Block writes containing credential patterns",
         "id": "pre:file:secret-scan"
       }
     ],

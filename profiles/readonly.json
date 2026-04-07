@@ -1,0 +1,40 @@
+{
+  "_comment": "Read-only profile — blocks all writes and shell execution. Use for code exploration, audits, or when you only want the agent to read and explain code.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"process.stderr.write('[readonly] BLOCKED: Shell execution is disabled in read-only mode.\\nRun commands yourself with: ! <command>\\n'); process.exit(2);\""
+          }
+        ],
+        "description": "Block all shell execution in read-only mode",
+        "id": "pre:bash:readonly"
+      },
+      {
+        "matcher": "Write|Edit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node -e \"process.stderr.write('[readonly] BLOCKED: File writes are disabled in read-only mode.\\n'); process.exit(2);\""
+          }
+        ],
+        "description": "Block all file writes in read-only mode",
+        "id": "pre:write:readonly"
+      },
+      {
+        "matcher": "Read|Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"CLAUDE_DIR/scripts/hooks/file-access.js\""
+          }
+        ],
+        "description": "Block access to sensitive files even in read-only mode",
+        "id": "pre:file:file-access"
+      }
+    ]
+  }
+}

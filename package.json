@@ -1,0 +1,12 @@
+{
+  "name": "claude-hardening",
+  "version": "1.0.0",
+  "description": "Hardening kit for Claude Code — hooks that block destructive commands, control network egress, and protect credentials",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node tests/run-tests.js"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "_comment": "File access policy for claude-hardening. Changes take effect immediately — no restart needed.",
+
+  "blockedDirs": [
+    ".vault",
+    "secrets"
+  ],
+
+  "blockedFiles": [
+    "*.secret"
+  ],
+
+  "blockedAbsolute": [],
+
+  "allowedPaths": [
+    "~/.ssh/known_hosts"
+  ]
+}

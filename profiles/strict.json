@@ -1,4 +1,5 @@
 {
+  "_comment": "Strict profile — maximum restrictions. Suitable for untrusted code, security reviews, or when running Claude in production environments.",
   "hooks": {
     "PreToolUse": [
       {
@@ -9,7 +10,7 @@
             "command": "node \"CLAUDE_DIR/scripts/hooks/deny-destructive.js\""
           }
         ],
-        "description": "Block destructive commands (rm -rf /, sudo, force push, etc.)",
+        "description": "Block destructive commands",
         "id": "pre:bash:deny-destructive"
       },
       {
@@ -20,7 +21,7 @@
             "command": "node \"CLAUDE_DIR/scripts/hooks/network-egress.js\""
           }
         ],
-        "description": "Block outbound network requests to domains not in allowlist",
+        "description": "Block outbound network to domains not in allowlist",
         "id": "pre:bash:network-egress"
       },
       {
@@ -31,7 +32,7 @@
             "command": "node \"CLAUDE_DIR/scripts/hooks/git-guard.js\""
           }
         ],
-        "description": "Warn on direct commits or pushes to main/master",
+        "description": "Block direct commits or pushes to main/master",
         "id": "pre:bash:git-guard"
       },
       {
@@ -42,7 +43,7 @@
             "command": "node \"CLAUDE_DIR/scripts/hooks/file-access.js\""
           }
         ],
-        "description": "Block access to sensitive files (.env, .ssh, credentials, etc.)",
+        "description": "Block access to sensitive files",
         "id": "pre:file:file-access"
       },
       {
@@ -53,20 +54,20 @@
             "command": "node \"CLAUDE_DIR/scripts/hooks/secret-scan.js\""
           }
         ],
-        "description": "Block writes containing credential patterns (API keys, tokens, private keys)",
+        "description": "Block writes containing credential patterns",
         "id": "pre:file:secret-scan"
       }
     ],
     "PostToolUse": [
       {
-        "matcher": "Bash|Write|Edit",
+        "matcher": "Bash|Write|Edit|Read",
         "hooks": [
           {
             "type": "command",
             "command": "node \"CLAUDE_DIR/scripts/hooks/audit-log.js\""
           }
         ],
-        "description": "Append tool use entries to ~/.claude/audit.log",
+        "description": "Append all tool use entries to ~/.claude/audit.log",
         "id": "post:all:audit-log"
       }
     ]

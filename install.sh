@@ -1,17 +1,18 @@
 #!/bin/bash
 set -euo pipefail
 
-# Claude Code Security Hardening — Installer
-# Installs deny-destructive and network-egress PreToolUse hooks.
+# Claude Code Hardening Kit — Installer
+# Installs all security hooks into ~/.claude.
 
 CLAUDE_DIR="${HOME}/.claude"
 HOOKS_DIR="${CLAUDE_DIR}/scripts/hooks"
 SETTINGS="${CLAUDE_DIR}/settings.json"
 ALLOWLIST="${CLAUDE_DIR}/network-allowlist.json"
+FILE_POLICY="${CLAUDE_DIR}/file-access-policy.json"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-echo "Claude Code Security Hardening"
-echo "=============================="
+echo "Claude Code Hardening Kit"
+echo "========================="
 echo ""
 
 # Check Node.js
@@ -27,16 +28,16 @@ if [ "$NODE_VERSION" -lt 18 ]; then
   exit 1
 fi
 
-echo "[1/4] Creating directories..."
+echo "[1/5] Creating directories..."
 mkdir -p "$HOOKS_DIR"
 
-echo "[2/4] Installing hook scripts..."
-cp "$SCRIPT_DIR/hooks/deny-destructive.js" "$HOOKS_DIR/deny-destructive.js"
-cp "$SCRIPT_DIR/hooks/network-egress.js" "$HOOKS_DIR/network-egress.js"
-echo "  -> $HOOKS_DIR/deny-destructive.js"
-echo "  -> $HOOKS_DIR/network-egress.js"
+echo "[2/5] Installing hook scripts..."
+for hook in deny-destructive network-egress git-guard file-access secret-scan audit-log; do
+  cp "$SCRIPT_DIR/hooks/${hook}.js" "$HOOKS_DIR/${hook}.js"
+  echo "  -> $HOOKS_DIR/${hook}.js"
+done
 
-echo "[3/4] Installing network allowlist..."
+echo "[3/5] Installing config files..."
 if [ -f "$ALLOWLIST" ]; then
   echo "  -> $ALLOWLIST already exists — skipping (won't overwrite)"
 else
@@ -44,51 +45,85 @@ else
   echo "  -> $ALLOWLIST"
 fi
 
-echo "[4/4] Configuring settings.json..."
+if [ -f "$FILE_POLICY" ]; then
+  echo "  -> $FILE_POLICY already exists — skipping (won't overwrite)"
+else
+  cat > "$FILE_POLICY" <<'EOF'
+{
+  "_comment": "File access policy for claude-hardening. See README for full options.",
+  "blockedDirs": [],
+  "blockedFiles": [],
+  "blockedAbsolute": [],
+  "allowedPaths": []
+}
+EOF
+  echo "  -> $FILE_POLICY"
+fi
+
+echo "[4/5] Configuring settings.json..."
 if [ ! -f "$SETTINGS" ]; then
-  # No settings.json — create one with the hooks
+  # No settings.json — create one with all hooks
   sed "s|CLAUDE_DIR|${CLAUDE_DIR}|g" "$SCRIPT_DIR/settings.example.json" > "$SETTINGS"
-  echo "  -> Created $SETTINGS with security hooks"
+  echo "  -> Created $SETTINGS with all security hooks"
 else
   # settings.json exists — check if hooks are already present
   if grep -q "deny-destructive" "$SETTINGS" 2>/dev/null; then
-    echo "  -> deny-destructive hook already present — skipping"
+    echo "  -> Hooks already present in $SETTINGS — skipping"
   else
     echo ""
-    echo "  NOTE: $SETTINGS already exists."
-    echo "  Add these hooks MANUALLY to the beginning of your PreToolUse array:"
+    echo "  NOTE: $SETTINGS already exists and does not contain the hardening hooks."
+    echo "  Add the following to your settings.json (see settings.example.json for"
+    echo "  the full structure, or copy a profile from profiles/):"
     echo ""
-    echo '  {'
-    echo '    "matcher": "Bash",'
-    echo '    "hooks": [{'
-    echo '      "type": "command",'
-    echo "      \"command\": \"node \\\"${HOOKS_DIR}/deny-destructive.js\\\"\""
-    echo '    }],'
-    echo '    "description": "Block destructive commands (rm -rf /, sudo, force push, etc.)",'
-    echo '    "id": "pre:bash:deny-destructive"'
-    echo '  },'
-    echo '  {'
-    echo '    "matcher": "Bash",'
-    echo '    "hooks": [{'
-    echo '      "type": "command",'
-    echo "      \"command\": \"node \\\"${HOOKS_DIR}/network-egress.js\\\"\""
-    echo '    }],'
-    echo '    "description": "Block outbound network requests to domains not in allowlist",'
-    echo '    "id": "pre:bash:network-egress"'
-    echo '  }'
+    echo "  Hooks to add under PreToolUse:"
+    echo "    pre:bash:deny-destructive   node \"${HOOKS_DIR}/deny-destructive.js\""
+    echo "    pre:bash:network-egress     node \"${HOOKS_DIR}/network-egress.js\""
+    echo "    pre:bash:git-guard          node \"${HOOKS_DIR}/git-guard.js\""
+    echo "    pre:file:file-access        node \"${HOOKS_DIR}/file-access.js\""
+    echo "    pre:file:secret-scan        node \"${HOOKS_DIR}/secret-scan.js\""
+    echo ""
+    echo "  Hook to add under PostToolUse:"
+    echo "    post:all:audit-log          node \"${HOOKS_DIR}/audit-log.js\""
+    echo ""
+    echo "  Or use a pre-built profile:"
+    echo "    cat $SCRIPT_DIR/profiles/standard.json"
     echo ""
   fi
 fi
 
+echo "[5/5] Verifying hook scripts..."
+all_ok=true
+for hook in deny-destructive network-egress git-guard file-access secret-scan audit-log; do
+  if node --check "$HOOKS_DIR/${hook}.js" 2>/dev/null; then
+    echo "  -> ${hook}.js OK"
+  else
+    echo "  -> ${hook}.js SYNTAX ERROR"
+    all_ok=false
+  fi
+done
+
+if [ "$all_ok" = false ]; then
+  echo ""
+  echo "ERROR: One or more hooks have syntax errors. Check Node.js version."
+  exit 1
+fi
+
 echo ""
-echo "Done. Installed files:"
-echo "  $HOOKS_DIR/deny-destructive.js"
-echo "  $HOOKS_DIR/network-egress.js"
-echo "  $ALLOWLIST"
+echo "Done. Installed:"
+echo "  Hooks:    $HOOKS_DIR/"
+echo "  Allowlist: $ALLOWLIST"
+echo "  Policy:   $FILE_POLICY"
+echo "  Settings: $SETTINGS"
 echo ""
-echo "To customize allowed network domains, edit:"
-echo "  $ALLOWLIST"
+echo "Quick customization:"
+echo "  Network domains  — edit $ALLOWLIST"
+echo "  Protected files  — edit $FILE_POLICY"
+echo "  Permission level — see profiles/ for strict/standard/readonly presets"
 echo ""
-echo "To verify, start a Claude Code session and ask the agent to run:"
-echo "  sudo ls              (should be blocked by deny-destructive)"
-echo "  curl https://example.com  (should be blocked by network-egress)"
+echo "Verify the install:"
+echo "  npm test   (from the repo root)"
+echo ""
+echo "To verify in a live Claude Code session:"
+echo "  sudo ls                    (blocked by deny-destructive)"
+echo "  curl https://example.com   (blocked by network-egress)"
+echo "  cat ~/.env                 (blocked by file-access)"

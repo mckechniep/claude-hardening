@@ -1,12 +1,18 @@
-# claude-hardening
+<p align="center">
+  <img src="logo.png" alt="claude-hardening" width="200" />
+</p>
 
-Security hooks for Claude Code that prevent AI agents from running destructive commands or exfiltrating data through shell access.
+<h1 align="center">claude-hardening</h1>
+
+<p align="center">A hardening kit for Claude Code that blocks destructive commands, controls network egress, protects credentials, and keeps AI agents from going rogue.</p>
 
 ## What it does
 
-Two PreToolUse hooks that intercept every Bash command before the agent executes it:
+Six hooks that intercept tool calls before or after the agent executes them:
 
-**deny-destructive** — blocks dangerous system commands
+### PreToolUse hooks
+
+**deny-destructive** — blocks dangerous shell commands
 
 | Tier | Commands | Behavior |
 |---|---|---|
@@ -24,32 +30,103 @@ Two PreToolUse hooks that intercept every Bash command before the agent executes
 | Requests to allowlisted domains | Passes through normally |
 | localhost / 127.0.0.1 | Always allowed |
 
+**git-guard** — warns on direct commits or pushes to main/master
+
+| What | Behavior |
+|---|---|
+| `git push origin main` | Blocked — redirected to feature branch |
+| `git commit` (any) | Stopped with branch-check reminder |
+| `git branch -D main` | Blocked — deleting primary branch |
+
+**file-access** — blocks reads and writes to sensitive files
+
+| What | Behavior |
+|---|---|
+| `~/.ssh/`, `~/.aws/`, `~/.gnupg/`, `~/.kube/` | Blocked |
+| `.env`, `.env.*`, `.env.local` | Blocked |
+| `*.pem`, `*.key`, `*.p12`, `*.pfx` | Blocked |
+| Files matching `credentials`, `secret`, `token`, `apikey` | Blocked |
+| `/etc/passwd`, `/etc/shadow`, `/etc/sudoers` | Blocked |
+| `.netrc`, `.git-credentials`, `.npmrc`, `.pypirc` | Blocked |
+| Normal project files | Pass through |
+
+Applies to **Read, Write, Edit, and Glob** tool calls.
+Config: `~/.claude/file-access-policy.json`
+
+**secret-scan** — scans file content before it is written to disk
+
+| What | Behavior |
+|---|---|
+| AWS access key IDs (`AKIA...`) | Blocked |
+| GitHub tokens (`ghp_...`, `ghs_...`) | Blocked |
+| OpenAI / Anthropic API keys (`sk-...`) | Blocked |
+| Slack tokens (`xoxb-...`, `xoxp-...`) | Blocked |
+| Stripe keys (`sk_live_...`, `sk_test_...`) | Blocked |
+| PEM private key blocks | Blocked |
+| Hardcoded `password = "..."` patterns | Blocked |
+| Database connection strings with credentials | Blocked |
+| `process.env.MY_SECRET` references | Passes through |
+
+Applies to **Write and Edit** tool calls.
+
+### PostToolUse hooks
+
+**audit-log** — appends a JSONL entry to `~/.claude/audit.log` for every Bash command and file write. Never blocks — silent observer only.
+
+```json
+{"ts":"2026-04-06T15:00:00.000Z","tool":"Bash","command":"git status","exit":0}
+{"ts":"2026-04-06T15:01:00.000Z","tool":"Write","file":"/project/src/index.js"}
+```
+
 ## Install
 
 ```bash
-git clone https://github.com/YOUR_ORG/claude-hardening.git
+git clone https://github.com/mckechniep/claude-hardening.git
 cd claude-hardening
 ./install.sh
 ```
 
 The installer:
-1. Copies hook scripts to `~/.claude/scripts/hooks/`
+1. Copies all six hook scripts to `~/.claude/scripts/hooks/`
 2. Creates `~/.claude/network-allowlist.json` (won't overwrite if it exists)
-3. Configures `~/.claude/settings.json` (or prints manual instructions if the file already exists)
+3. Creates `~/.claude/file-access-policy.json` (won't overwrite if it exists)
+4. Configures `~/.claude/settings.json` (or prints manual instructions if the file already exists)
+5. Syntax-checks each hook with Node.js
 
 Requires Node.js 18+.
+
+## Verify
+
+```bash
+npm test
+```
+
+Runs 32 tests covering every hook — pass/fail rules, edge cases, and allow-list behavior.
 
 ## Files
 
 ```
 claude-hardening/
 ├── hooks/
-│   ├── deny-destructive.js          # Destructive command deny list
-│   └── network-egress.js            # Network egress control
+│   ├── deny-destructive.js          # Destructive shell command deny list
+│   ├── network-egress.js            # Network egress allowlist control
+│   ├── git-guard.js                 # Git branch protection
+│   ├── file-access.js               # Sensitive file path protection
+│   ├── secret-scan.js               # Credential pattern detection
+│   └── audit-log.js                 # Session audit trail (PostToolUse)
+├── profiles/
+│   ├── standard.json                # All hooks — good default
+│   ├── strict.json                  # All hooks + Read in audit log
+│   └── readonly.json                # Blocks all Bash and file writes
+├── templates/
+│   └── CLAUDE.md                    # Behavioral guardrails for agents
+├── tests/
+│   └── run-tests.js                 # 32 tests across all hooks
 ├── network-allowlist.example.json   # Default trusted domains
-├── settings.example.json            # Example settings.json snippet
-├── install.sh                       # Installer script
-└── README.md
+├── file-access-policy.example.json  # File access policy template
+├── settings.example.json            # Example settings.json with all hooks
+├── package.json                     # npm test entry point
+└── install.sh                       # Installer script
 ```
 
 After install, your `~/.claude/` will contain:
@@ -58,12 +135,41 @@ After install, your `~/.claude/` will contain:
 ~/.claude/
 ├── scripts/hooks/
 │   ├── deny-destructive.js
-│   └── network-egress.js
+│   ├── network-egress.js
+│   ├── git-guard.js
+│   ├── file-access.js
+│   ├── secret-scan.js
+│   └── audit-log.js
 ├── network-allowlist.json
+├── file-access-policy.json
+├── audit.log                        # Created on first session
 └── settings.json
 ```
 
-## Customizing the allowlist
+## Profiles
+
+Pre-built permission levels in `profiles/`:
+
+| Profile | Bash | Writes | Network | File reads | Audit |
+|---|---|---|---|---|---|
+| `standard.json` | Guarded | Secret-scanned | Allowlisted | Sensitive blocked | Yes |
+| `strict.json` | Guarded | Secret-scanned | Allowlisted | Sensitive blocked | Yes (incl. reads) |
+| `readonly.json` | Blocked | Blocked | — | Sensitive blocked | No |
+
+To apply a profile, merge its contents into `~/.claude/settings.json`.
+
+## Templates
+
+`templates/CLAUDE.md` is a ready-to-use behavioral policy file. Drop it into a project root as `CLAUDE.md` to give the agent explicit instructions about:
+
+- Not hardcoding secrets
+- Using feature branches instead of committing to main
+- Asking before destructive operations
+- Escalating with `! command` when human intent is needed
+
+The hook layer and the CLAUDE.md layer are complementary — hooks are enforced mechanically; CLAUDE.md shapes intent before the agent tries.
+
+## Customizing the network allowlist
 
 Edit `~/.claude/network-allowlist.json` to add trusted domains:
 
@@ -80,9 +186,30 @@ Edit `~/.claude/network-allowlist.json` to add trusted domains:
 }
 ```
 
-Changes take effect immediately — the hook reads the file on every command. No restart needed.
+Changes take effect immediately — no restart needed. Subdomains are matched automatically: adding `github.com` also allows `api.github.com`.
 
-Subdomains are matched automatically: adding `github.com` also allows `api.github.com`, `raw.githubusercontent.com` won't match though — add it explicitly if needed.
+## Customizing file access
+
+Edit `~/.claude/file-access-policy.json` to extend or override the defaults:
+
+```json
+{
+  "blockedDirs": [
+    ".vault",
+    "secrets"
+  ],
+  "blockedFiles": [
+    "*.secret"
+  ],
+  "allowedPaths": [
+    "~/.ssh/known_hosts"
+  ]
+}
+```
+
+- `blockedDirs` — additional directories to block (relative to `~` or absolute)
+- `blockedFiles` — additional filename regex patterns to block
+- `allowedPaths` — explicit escape hatch for paths you intentionally need access to
 
 ## When commands get blocked
 
@@ -107,7 +234,7 @@ mv ~/.claude/network-allowlist.json ~/.claude/network-allowlist.json.disabled
 mv ~/.claude/network-allowlist.json.disabled ~/.claude/network-allowlist.json
 ```
 
-**Both hooks:** remove the hook entries from `~/.claude/settings.json`.
+**All hooks:** remove the hook entries from `~/.claude/settings.json`.
 
 ## Coverage and limitations
 
@@ -116,26 +243,32 @@ mv ~/.claude/network-allowlist.json.disabled ~/.claude/network-allowlist.json
 | Recursive filesystem deletion | Yes |
 | Privilege escalation (sudo) | Yes |
 | Destructive git operations | Yes |
+| Direct commits to main/master | Yes |
 | Data exfiltration via curl/wget | Yes |
 | Raw socket connections (netcat) | Yes |
 | SSH/SCP to unknown hosts | Yes |
 | Dynamic/variable URLs | Yes |
 | Fork bombs / disk destruction | Yes |
+| Reading credential files (.ssh, .aws, .env) | Yes |
+| Writing secrets / API keys to files | Yes |
+| Session audit trail | Yes |
 | DNS tunneling | No |
 | Obfuscated/aliased commands | Partial |
-| Non-shell exfiltration (MCP tools) | No |
+| Non-shell exfiltration via MCP tools | No |
+| Secrets leaked through stdout/response | No |
 
-These hooks inspect the command string, not the shell execution environment. Sophisticated evasion through aliasing, encoding, or subshell tricks is possible but raises the bar significantly against prompt injection attacks.
+These hooks inspect the command string and file path/content, not the shell execution environment. Sophisticated evasion through aliasing, encoding, or subshell tricks is possible but raises the bar significantly against prompt injection attacks.
 
 ## Uninstall
 
 ```bash
-rm ~/.claude/scripts/hooks/deny-destructive.js
-rm ~/.claude/scripts/hooks/network-egress.js
+cd ~/.claude/scripts/hooks/
+rm deny-destructive.js network-egress.js git-guard.js file-access.js secret-scan.js audit-log.js
 rm ~/.claude/network-allowlist.json
+rm ~/.claude/file-access-policy.json
 ```
 
-Then remove the two hook entries from `~/.claude/settings.json`.
+Then remove the hook entries from `~/.claude/settings.json`.
 
 ## License
 
