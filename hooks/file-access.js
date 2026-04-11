@@ -1,9 +1,14 @@
 #!/usr/bin/env node
 /**
- * File Access Hook (PreToolUse:Read,Write,Edit,Glob)
+ * File Access Hook (PreToolUse:Read,Write,Edit,Glob,Bash)
  *
  * Blocks access to sensitive files and directories that an AI agent
  * should not read or write — credentials, SSH keys, env files, etc.
+ *
+ * For Read/Write/Edit/Glob tools, inspects the file_path parameter.
+ * For Bash tool, extracts path arguments from common file commands
+ * (cat, head, tail, less, more, cp, mv, vim, nano, etc.) as a
+ * regex-based fallback when bwrap sandboxing is not available.
  *
  * Policy: ~/.claude/file-access-policy.json
  * Falls back to built-in defaults when the policy file is missing.
@@ -36,18 +41,17 @@ const DEFAULT_BLOCKED_DIRS = [
 const DEFAULT_BLOCKED_FILES = [
   // Env files
   /^\.env(\.|$)/,
-  // Credential filenames
-  /credentials/i,
-  /secret/i,
+  // Credential filenames (anchored to avoid matching source files like TokenService.ts)
+  /^\.?(credentials|creds)(\..+)?$/i,
+  /^\.?(secrets?)(\..+)?$/i,
+  /^\.?(tokens?|auth[_-]tokens?)(\..+)?$/i,
+  /^\.?(api[_-]?keys?)(\..+)?$/i,
+  // Certificate and key files
   /\.pem$/i,
   /\.key$/i,
   /\.p12$/i,
   /\.pfx$/i,
   /\.jks$/i,
-  // Common token files
-  /token/i,
-  /apikey/i,
-  /api[_-]key/i,
   // Auth config files
   /^\.netrc$/,
   /^\.git-credentials$/,
@@ -65,6 +69,47 @@ const DEFAULT_BLOCKED_ABSOLUTE = [
   '/etc/sudoers',
   '/etc/master.passwd',
 ];
+
+// Shell commands that take file path arguments. Captures the argument after
+// the command name and optional flags (tokens starting with -).
+const FILE_COMMANDS = [
+  'cat', 'head', 'tail', 'less', 'more', 'tac', 'nl',
+  'cp', 'mv', 'ln',
+  'vim', 'vi', 'nano', 'emacs',
+  'source', '\\.',
+  'chmod', 'chown', 'chgrp',
+  'stat', 'file', 'wc',
+  'diff', 'cmp',
+  'tar', 'zip', 'unzip', 'gzip', 'gunzip',
+  'base64',
+  'openssl',
+  'gpg',
+];
+
+const FILE_CMD_PATTERN = new RegExp(
+  '\\b(' + FILE_COMMANDS.join('|') + ')\\s+' +
+  '(?:-[a-zA-Z0-9]+\\s+)*' +   // skip flags
+  '([~/.][^\\s;|&><]+)',        // capture path-like argument
+  'g'
+);
+
+function extractPathsFromBash(cmd) {
+  const paths = [];
+  let match;
+  // Reset lastIndex for global regex
+  FILE_CMD_PATTERN.lastIndex = 0;
+  while ((match = FILE_CMD_PATTERN.exec(cmd)) !== null) {
+    const p = match[2].replace(/^~/, os.homedir());
+    paths.push(p);
+  }
+  // Also catch redirection targets: > /path, >> /path, < /path
+  const redirectPattern = /[<>]+\s*([~/.][^\s;|&><]+)/g;
+  while ((match = redirectPattern.exec(cmd)) !== null) {
+    const p = match[1].replace(/^~/, os.homedir());
+    paths.push(p);
+  }
+  return paths;
+}
 
 const MAX_STDIN = 1024 * 1024;
 let data = '';
@@ -96,8 +141,22 @@ process.stdin.on('end', () => {
   } else if (toolName === 'Edit') {
     filePath = toolInput.file_path || '';
   } else if (toolName === 'Glob') {
-    // For Glob, check the pattern and path for suspicious targets
     filePath = toolInput.path || toolInput.pattern || '';
+  } else if (toolName === 'Bash') {
+    // Extract file paths from common shell commands as a regex fallback.
+    // This is best-effort — the sandbox-exec.js hook provides comprehensive
+    // protection via bwrap when available.
+    const cmd = (toolInput.command || '').trim();
+    if (cmd) {
+      const pathsFromBash = extractPathsFromBash(cmd);
+      for (const p of pathsFromBash) {
+        const result = checkPath(p, input);
+        if (result === 'blocked') process.exit(2);
+      }
+    }
+    // If we get here, all extracted paths are safe (or no paths found)
+    process.stdout.write(data);
+    process.exit(0);
   }
 
   if (!filePath) {
@@ -105,6 +164,18 @@ process.stdin.on('end', () => {
     process.exit(0);
   }
 
+  // Check the file path
+  const result = checkPath(filePath, input);
+  if (result === 'blocked') process.exit(2);
+
+  // Path is safe
+  process.stdout.write(data);
+  process.exit(0);
+});
+
+// ── Path checking logic (shared by tool-path and bash-path branches) ──
+
+function checkPath(filePath) {
   // Load policy overrides if present
   let policy = {};
   try {
@@ -117,7 +188,6 @@ process.stdin.on('end', () => {
   const extraBlockedFiles = Array.isArray(policy.blockedFiles) ? policy.blockedFiles : [];
   const allowedPaths = Array.isArray(policy.allowedPaths) ? policy.allowedPaths : [];
 
-  // Resolve to absolute path for matching
   const resolved = path.resolve(filePath);
   const basename = path.basename(resolved);
   const home = os.homedir();
@@ -126,8 +196,7 @@ process.stdin.on('end', () => {
   for (const allowed of allowedPaths) {
     const resolvedAllowed = path.resolve(allowed.replace(/^~/, home));
     if (resolved === resolvedAllowed || resolved.startsWith(resolvedAllowed + path.sep)) {
-      process.stdout.write(data);
-      process.exit(0);
+      return 'allowed';
     }
   }
 
@@ -136,6 +205,7 @@ process.stdin.on('end', () => {
   for (const blocked of blockedAbsolute) {
     if (resolved === blocked) {
       block(filePath, `${basename} is a protected system file`);
+      return 'blocked';
     }
   }
 
@@ -145,6 +215,7 @@ process.stdin.on('end', () => {
     const absDir = dir.startsWith('/') ? dir : path.join(home, dir);
     if (resolved.startsWith(absDir + path.sep) || resolved === absDir) {
       block(filePath, `path is inside protected directory: ~/${dir}`);
+      return 'blocked';
     }
   }
 
@@ -153,13 +224,12 @@ process.stdin.on('end', () => {
   for (const pattern of allBlockedFiles) {
     if (pattern.test(basename)) {
       block(filePath, `filename matches sensitive pattern: ${pattern}`);
+      return 'blocked';
     }
   }
 
-  // Path is safe
-  process.stdout.write(data);
-  process.exit(0);
-});
+  return 'allowed';
+}
 
 function block(filePath, reason) {
   process.stderr.write(
@@ -167,7 +237,6 @@ function block(filePath, reason) {
     'Path: ' + filePath + '\n' +
     'If this is intentional, add the path to ~/.claude/file-access-policy.json allowedPaths.\n'
   );
-  process.exit(2);
 }
 
 process.stdin.on('error', () => {

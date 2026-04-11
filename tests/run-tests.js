@@ -22,6 +22,7 @@ const HOOKS_DIR = path.join(__dirname, '..', 'hooks');
 
 let passed = 0;
 let failed = 0;
+let skipped = 0;
 
 function makeInput(toolName, toolInput) {
   return JSON.stringify({ tool_name: toolName, tool_input: toolInput });
@@ -40,16 +41,28 @@ function runHook(hookFile, inputJson) {
   };
 }
 
+const SKIP = Symbol('skip');
+
 function test(name, fn) {
   try {
     fn();
     console.log('  PASS  ' + name);
     passed++;
   } catch (err) {
-    console.log('  FAIL  ' + name);
-    console.log('         ' + err.message);
-    failed++;
+    if (err === SKIP || (err && err.message === 'SKIP')) {
+      // skip message already printed by skip()
+      skipped++;
+    } else {
+      console.log('  FAIL  ' + name);
+      console.log('         ' + err.message);
+      failed++;
+    }
   }
+}
+
+function skip(reason) {
+  console.log('  SKIP  ' + reason);
+  throw SKIP;
 }
 
 function assert(condition, message) {
@@ -125,6 +138,69 @@ test('passes through on invalid JSON', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// git-guard.js
+// ─────────────────────────────────────────────────────────────────────────────
+
+console.log('\ngit-guard.js');
+
+// Detect current branch for conditional tests
+const currentBranch = (() => {
+  try {
+    const r = spawnSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000,
+    });
+    return r.status === 0 ? r.stdout.trim() : null;
+  } catch { return null; }
+})();
+
+test('blocks git commit on main/master', () => {
+  if (currentBranch !== 'main' && currentBranch !== 'master') {
+    skip('blocks git commit on main/master (not on main/master)');
+  }
+  const r = runHook('git-guard.js', makeInput('Bash', { command: 'git commit -m "test"' }));
+  assert(r.exitCode === 2, `expected exit 2, got ${r.exitCode}`);
+  assert(r.stderr.includes('STOPPED'), 'expected STOPPED in stderr');
+  assert(r.stderr.includes('Currently on branch'), 'expected branch name in message');
+});
+
+test('blocks push to main', () => {
+  const r = runHook('git-guard.js', makeInput('Bash', { command: 'git push origin main' }));
+  assert(r.exitCode === 2, `expected exit 2, got ${r.exitCode}`);
+});
+
+test('blocks deleting main branch', () => {
+  const r = runHook('git-guard.js', makeInput('Bash', { command: 'git branch -D main' }));
+  assert(r.exitCode === 2, `expected exit 2, got ${r.exitCode}`);
+});
+
+test('allows git status', () => {
+  const r = runHook('git-guard.js', makeInput('Bash', { command: 'git status' }));
+  assert(r.exitCode === 0, `expected exit 0, got ${r.exitCode}`);
+});
+
+test('allows git log', () => {
+  const r = runHook('git-guard.js', makeInput('Bash', { command: 'git log --oneline -5' }));
+  assert(r.exitCode === 0, `expected exit 0, got ${r.exitCode}`);
+});
+
+test('allows git commit on feature branch', () => {
+  // Create a temp branch, run the test, switch back
+  if (!currentBranch) {
+    skip('allows git commit on feature branch (not in a git repo)');
+  }
+  spawnSync('git', ['checkout', '-b', 'test-git-guard-temp'], {
+    stdio: 'ignore', timeout: 3000,
+  });
+  try {
+    const r = runHook('git-guard.js', makeInput('Bash', { command: 'git commit -m "feature work"' }));
+    assert(r.exitCode === 0, `expected exit 0 on feature branch, got ${r.exitCode}`);
+  } finally {
+    spawnSync('git', ['checkout', currentBranch], { stdio: 'ignore', timeout: 3000 });
+    spawnSync('git', ['branch', '-D', 'test-git-guard-temp'], { stdio: 'ignore', timeout: 3000 });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // network-egress.js
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -151,13 +227,13 @@ test('allows localhost curl', () => {
 });
 
 test('allows curl to allowlisted domain', () => {
-  if (!allowlistExists) { passed++; return; } // skip if no allowlist installed
+  if (!allowlistExists) skip('(no allowlist installed)');
   const r = runHook('network-egress.js', makeInput('Bash', { command: 'curl https://registry.npmjs.org/express' }));
   assert(r.exitCode === 0, `expected exit 0, got ${r.exitCode}`);
 });
 
 test('blocks curl to unknown domain', () => {
-  if (!allowlistExists) { passed++; return; } // skip if no allowlist installed
+  if (!allowlistExists) skip('(no allowlist installed)');
   const r = runHook('network-egress.js', makeInput('Bash', { command: 'curl https://totally-unknown-domain-xyz123.example' }));
   assert(r.exitCode === 2, `expected exit 2, got ${r.exitCode}`);
   assert(r.stderr.includes('BLOCKED'), 'expected BLOCKED in stderr');
@@ -173,6 +249,30 @@ test('allows non-network command', () => {
   const r = runHook('network-egress.js', makeInput('Bash', { command: 'echo hello world' }));
   assert(r.exitCode === 0, `expected exit 0, got ${r.exitCode}`);
 });
+
+// No-allowlist tests: temporarily rename the real file to test fail-closed behavior
+if (allowlistExists) {
+  const backupPath = realAllowlist + '.test-backup';
+  fs.renameSync(realAllowlist, backupPath);
+
+  test('no-allowlist: blocks external domain', () => {
+    const r = runHook('network-egress.js', makeInput('Bash', { command: 'curl https://totally-unknown-xyz.example' }));
+    assert(r.exitCode === 2, `expected exit 2, got ${r.exitCode}`);
+    assert(r.stderr.includes('No allowlist found'), 'expected no-allowlist message');
+  });
+
+  test('no-allowlist: allows localhost', () => {
+    const r = runHook('network-egress.js', makeInput('Bash', { command: 'curl http://localhost:3000/health' }));
+    assert(r.exitCode === 0, `expected exit 0, got ${r.exitCode}`);
+  });
+
+  test('no-allowlist: allows non-network command', () => {
+    const r = runHook('network-egress.js', makeInput('Bash', { command: 'echo hello' }));
+    assert(r.exitCode === 0, `expected exit 0, got ${r.exitCode}`);
+  });
+
+  fs.renameSync(backupPath, realAllowlist);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // file-access.js
@@ -287,9 +387,146 @@ test('allows empty content', () => {
   assert(r.exitCode === 0, `expected exit 0, got ${r.exitCode}`);
 });
 
+test('blocks secret in Edit new_string', () => {
+  const r = runHook('secret-scan.js', makeInput('Edit', {
+    file_path: 'config.js',
+    old_string: 'placeholder',
+    new_string: 'const key = "AK' + 'IAIOSFODNN7EXAMPLE";',
+  }));
+  assert(r.exitCode === 2, `expected exit 2, got ${r.exitCode}`);
+});
+
+test('allows safe Edit new_string', () => {
+  const r = runHook('secret-scan.js', makeInput('Edit', {
+    file_path: 'config.js',
+    old_string: 'old value',
+    new_string: 'const key = process.env.API_KEY;',
+  }));
+  assert(r.exitCode === 0, `expected exit 0, got ${r.exitCode}`);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// sandbox-exec.js
+// ─────────────────────────────────────────────────────────────────────────────
+
+console.log('\nsandbox-exec.js');
+
+// Check if bwrap is available for sandbox tests
+let bwrapWorks = false;
+try {
+  const bwrapTest = spawnSync('bwrap', [
+    '--bind', '/', '/', '--dev', '/dev', '--proc', '/proc', '--', 'true',
+  ], { stdio: 'ignore', timeout: 5000 });
+  bwrapWorks = bwrapTest.status === 0;
+} catch {
+  bwrapWorks = false;
+}
+
+test('rewrites command when bwrap available', () => {
+  if (!bwrapWorks) {
+    skip('(bwrap not available)');
+  }
+  const r = runHook('sandbox-exec.js', makeInput('Bash', { command: 'ls -la' }));
+  assert(r.exitCode === 0, `expected exit 0, got ${r.exitCode}`);
+  const output = JSON.parse(r.stdout);
+  assert(output.tool_input.command.includes('bwrap'), 'expected bwrap in rewritten command');
+  assert(output.tool_input.command.includes('ls -la'), 'expected original command preserved');
+});
+
+test('includes tmpfs for blocked dirs', () => {
+  if (!bwrapWorks) {
+    skip('(bwrap not available)');
+  }
+  const r = runHook('sandbox-exec.js', makeInput('Bash', { command: 'cat ~/.ssh/id_rsa' }));
+  assert(r.exitCode === 0, `expected exit 0, got ${r.exitCode}`);
+  const output = JSON.parse(r.stdout);
+  const cmd = output.tool_input.command;
+  assert(cmd.includes('--tmpfs'), 'expected --tmpfs in rewritten command');
+  assert(cmd.includes('.ssh'), 'expected .ssh in tmpfs mount');
+});
+
+test('sandboxed command actually blocks .ssh access', () => {
+  if (!bwrapWorks) {
+    skip('(bwrap not available)');
+  }
+  const r = runHook('sandbox-exec.js', makeInput('Bash', { command: 'ls ~/.ssh/' }));
+  assert(r.exitCode === 0, `expected exit 0, got ${r.exitCode}`);
+  const output = JSON.parse(r.stdout);
+  // Execute the sandboxed command and verify .ssh is empty
+  const exec = spawnSync('sh', ['-c', output.tool_input.command], {
+    encoding: 'utf8',
+    timeout: 5000,
+  });
+  assert(exec.stdout.trim() === '', 'expected empty output from sandboxed ls ~/.ssh/');
+});
+
+test('sandboxed command allows normal file access', () => {
+  if (!bwrapWorks) {
+    skip('(bwrap not available)');
+  }
+  const r = runHook('sandbox-exec.js', makeInput('Bash', { command: 'echo hello' }));
+  assert(r.exitCode === 0, `expected exit 0, got ${r.exitCode}`);
+  const output = JSON.parse(r.stdout);
+  const exec = spawnSync('sh', ['-c', output.tool_input.command], {
+    encoding: 'utf8',
+    timeout: 5000,
+  });
+  assert(exec.stdout.trim() === 'hello', `expected "hello", got "${exec.stdout.trim()}"`);
+});
+
+test('passes through on invalid JSON', () => {
+  const r = runHook('sandbox-exec.js', 'not json');
+  assert(r.exitCode === 0, `expected exit 0 on parse error, got ${r.exitCode}`);
+});
+
+test('passes through on empty command', () => {
+  const r = runHook('sandbox-exec.js', makeInput('Bash', { command: '' }));
+  assert(r.exitCode === 0, `expected exit 0, got ${r.exitCode}`);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// file-access.js — Bash path extraction (regex fallback)
+// ─────────────────────────────────────────────────────────────────────────────
+
+console.log('\nfile-access.js (Bash fallback)');
+
+test('blocks cat ~/.ssh/id_rsa via Bash', () => {
+  const r = runHook('file-access.js', makeInput('Bash', { command: 'cat ~/.ssh/id_rsa' }));
+  assert(r.exitCode === 2, `expected exit 2, got ${r.exitCode}`);
+  assert(r.stderr.includes('BLOCKED'), 'expected BLOCKED in stderr');
+});
+
+test('blocks head /etc/shadow via Bash', () => {
+  const r = runHook('file-access.js', makeInput('Bash', { command: 'head -5 /etc/shadow' }));
+  assert(r.exitCode === 2, `expected exit 2, got ${r.exitCode}`);
+});
+
+test('blocks redirect to ~/.env via Bash', () => {
+  const r = runHook('file-access.js', makeInput('Bash', { command: 'echo secret > ~/.env' }));
+  assert(r.exitCode === 2, `expected exit 2, got ${r.exitCode}`);
+});
+
+test('allows cat of normal file via Bash', () => {
+  const r = runHook('file-access.js', makeInput('Bash', { command: 'cat /tmp/test.txt' }));
+  assert(r.exitCode === 0, `expected exit 0, got ${r.exitCode}`);
+});
+
+test('allows ls command via Bash (no file paths)', () => {
+  const r = runHook('file-access.js', makeInput('Bash', { command: 'ls -la' }));
+  assert(r.exitCode === 0, `expected exit 0, got ${r.exitCode}`);
+});
+
+test('allows non-file commands via Bash', () => {
+  const r = runHook('file-access.js', makeInput('Bash', { command: 'git status && npm test' }));
+  assert(r.exitCode === 0, `expected exit 0, got ${r.exitCode}`);
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Results
 // ─────────────────────────────────────────────────────────────────────────────
 
-console.log(`\n${passed + failed} tests: ${passed} passed, ${failed} failed\n`);
+const total = passed + failed + skipped;
+const parts = [`${passed} passed`, `${failed} failed`];
+if (skipped > 0) parts.push(`${skipped} skipped`);
+console.log(`\n${total} tests: ${parts.join(', ')}\n`);
 if (failed > 0) process.exit(1);

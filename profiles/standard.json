@@ -7,6 +7,17 @@
         "hooks": [
           {
             "type": "command",
+            "command": "node \"CLAUDE_DIR/scripts/hooks/sandbox-exec.js\""
+          }
+        ],
+        "description": "Sandbox Bash commands via bwrap (standard mode — credential dirs blocked)",
+        "id": "pre:bash:sandbox-exec"
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
             "command": "node \"CLAUDE_DIR/scripts/hooks/deny-destructive.js\""
           }
         ],
@@ -36,7 +47,7 @@
         "id": "pre:bash:git-guard"
       },
       {
-        "matcher": "Read|Write|Edit|Glob",
+        "matcher": "Bash|Read|Write|Edit|Glob",
         "hooks": [
           {
             "type": "command",

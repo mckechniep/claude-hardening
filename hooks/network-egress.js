@@ -48,12 +48,13 @@ process.stdin.on('end', () => {
 
   // Load allowlist
   let config;
+  let noAllowlist = false;
   try {
     config = JSON.parse(fs.readFileSync(ALLOWLIST_PATH, 'utf8'));
   } catch {
-    // No allowlist file — pass through rather than breaking all network commands
-    process.stdout.write(data);
-    process.exit(0);
+    // No allowlist file — fail closed with localhost exception
+    config = { allowedDomains: [], allowLocalhost: true, warnOnVariableUrls: true };
+    noAllowlist = true;
   }
 
   const allowedDomains = Array.isArray(config.allowedDomains) ? config.allowedDomains : [];
@@ -82,6 +83,7 @@ process.stdin.on('end', () => {
     { pattern: /\b(curl|wget)\s/, name: 'curl/wget' },
     { pattern: /\b(nc|ncat|netcat)\s/, name: 'netcat' },
     { pattern: /\b(ssh|scp|rsync)\s/, name: 'ssh/scp/rsync' },
+    { pattern: /\bgit\s+(clone|fetch|pull|push|ls-remote)\s/, name: 'git network' },
   ];
 
   let hasNetworkTool = false;
@@ -102,7 +104,7 @@ process.stdin.on('end', () => {
   // ── Check for variable/dynamic URLs ─────────────────────────────────
   // Shell variables in URLs cannot be resolved at hook time — block by default
 
-  const variableUrlPattern = /https?:\/\/[^\s'"]*\$[{(a-zA-Z_]/;
+  const variableUrlPattern = /(?:https?|ftp|ftps|sftp|git\+ssh):\/\/[^\s'"]*\$[{(a-zA-Z_]/;
   if (warnOnVariableUrls && variableUrlPattern.test(cmd)) {
     process.stderr.write(
       '[network-egress] BLOCKED: ' + toolName + ' with dynamic/variable URL\n' +
@@ -115,7 +117,7 @@ process.stdin.on('end', () => {
 
   // ── Extract URLs and check domains ──────────────────────────────────
 
-  const urlPattern = /https?:\/\/([^/:@\s'"]+)/g;
+  const urlPattern = /(?:https?|ftp|ftps|sftp|git\+ssh):\/\/([^/:@\s'"]+)/g;
   const hostArgPattern = /(?:@|(?:nc|ncat|netcat|ssh|scp|rsync)\s+(?:-[^\s]*\s+)*)([a-zA-Z0-9][-a-zA-Z0-9.]+)/g;
 
   const domains = new Set();
@@ -159,12 +161,22 @@ process.stdin.on('end', () => {
 
   if (blocked.length > 0) {
     const plural = blocked.length > 1 ? 's' : '';
-    process.stderr.write(
-      '[network-egress] BLOCKED: ' + toolName + ' to unknown domain' + plural + ': ' + blocked.join(', ') + '\n' +
-      'Command: ' + cmd.substring(0, 200) + '\n' +
-      'Add to ~/.claude/network-allowlist.json if trusted, or run it yourself:\n' +
-      '  ! ' + cmd.substring(0, 300) + '\n'
-    );
+    if (noAllowlist) {
+      process.stderr.write(
+        '[network-egress] BLOCKED: ' + toolName + ' to domain' + plural + ': ' + blocked.join(', ') + '\n' +
+        'Command: ' + cmd.substring(0, 200) + '\n' +
+        'No allowlist found at ~/.claude/network-allowlist.json — all external network access is blocked.\n' +
+        'Create the file with trusted domains, or run it yourself:\n' +
+        '  ! ' + cmd.substring(0, 300) + '\n'
+      );
+    } else {
+      process.stderr.write(
+        '[network-egress] BLOCKED: ' + toolName + ' to unknown domain' + plural + ': ' + blocked.join(', ') + '\n' +
+        'Command: ' + cmd.substring(0, 200) + '\n' +
+        'Add to ~/.claude/network-allowlist.json if trusted, or run it yourself:\n' +
+        '  ! ' + cmd.substring(0, 300) + '\n'
+      );
+    }
     process.exit(2);
   }
 

@@ -28,16 +28,33 @@ if [ "$NODE_VERSION" -lt 18 ]; then
   exit 1
 fi
 
-echo "[1/5] Creating directories..."
+# Check bwrap
+BWRAP_AVAILABLE=false
+if command -v bwrap &> /dev/null; then
+  if bwrap --bind / / --dev /dev --proc /proc -- true 2>/dev/null; then
+    BWRAP_AVAILABLE=true
+    echo "bwrap detected — OS-level sandbox protection will be active."
+  else
+    echo "WARNING: bwrap found but not functional (user namespaces may be disabled)."
+    echo "Sandbox hook will fall back to regex-based protection."
+  fi
+else
+  echo "NOTE: bubblewrap (bwrap) not found."
+  echo "  Install it for OS-level sandbox protection: sudo apt install bubblewrap"
+  echo "  The sandbox hook will fall back to regex-based protection without it."
+fi
+echo ""
+
+echo "[1/7] Creating directories..."
 mkdir -p "$HOOKS_DIR"
 
-echo "[2/5] Installing hook scripts..."
-for hook in deny-destructive network-egress git-guard file-access secret-scan audit-log; do
+echo "[2/7] Installing hook scripts..."
+for hook in sandbox-exec deny-destructive network-egress git-guard file-access secret-scan audit-log; do
   cp "$SCRIPT_DIR/hooks/${hook}.js" "$HOOKS_DIR/${hook}.js"
   echo "  -> $HOOKS_DIR/${hook}.js"
 done
 
-echo "[3/5] Installing config files..."
+echo "[3/7] Installing config files..."
 if [ -f "$ALLOWLIST" ]; then
   echo "  -> $ALLOWLIST already exists — skipping (won't overwrite)"
 else
@@ -51,16 +68,18 @@ else
   cat > "$FILE_POLICY" <<'EOF'
 {
   "_comment": "File access policy for claude-hardening. See README for full options.",
+  "sandboxMode": "standard",
   "blockedDirs": [],
   "blockedFiles": [],
   "blockedAbsolute": [],
-  "allowedPaths": []
+  "allowedPaths": [],
+  "writablePaths": ["/tmp"]
 }
 EOF
   echo "  -> $FILE_POLICY"
 fi
 
-echo "[4/5] Configuring settings.json..."
+echo "[4/7] Configuring settings.json..."
 if [ ! -f "$SETTINGS" ]; then
   # No settings.json — create one with all hooks
   sed "s|CLAUDE_DIR|${CLAUDE_DIR}|g" "$SCRIPT_DIR/settings.example.json" > "$SETTINGS"
@@ -71,29 +90,90 @@ else
     echo "  -> Hooks already present in $SETTINGS — skipping"
   else
     echo ""
-    echo "  NOTE: $SETTINGS already exists and does not contain the hardening hooks."
-    echo "  Add the following to your settings.json (see settings.example.json for"
-    echo "  the full structure, or copy a profile from profiles/):"
+    echo "  Found existing $SETTINGS without hardening hooks."
     echo ""
-    echo "  Hooks to add under PreToolUse:"
-    echo "    pre:bash:deny-destructive   node \"${HOOKS_DIR}/deny-destructive.js\""
-    echo "    pre:bash:network-egress     node \"${HOOKS_DIR}/network-egress.js\""
-    echo "    pre:bash:git-guard          node \"${HOOKS_DIR}/git-guard.js\""
-    echo "    pre:file:file-access        node \"${HOOKS_DIR}/file-access.js\""
-    echo "    pre:file:secret-scan        node \"${HOOKS_DIR}/secret-scan.js\""
-    echo ""
-    echo "  Hook to add under PostToolUse:"
-    echo "    post:all:audit-log          node \"${HOOKS_DIR}/audit-log.js\""
-    echo ""
-    echo "  Or use a pre-built profile:"
-    echo "    cat $SCRIPT_DIR/profiles/standard.json"
-    echo ""
+    read -rp "  Merge hardening hooks into existing settings.json? [y/N] " merge_answer
+    if [[ "$merge_answer" =~ ^[Yy]$ ]]; then
+      # Back up before touching anything
+      backup="${SETTINGS}.backup.$(date +%Y%m%d%H%M%S)"
+      cp "$SETTINGS" "$backup"
+      echo "  -> Backed up to $backup"
+
+      # Merge using node — deduplicates by hook id, preserves everything else
+      # Paths passed via process.argv to avoid shell interpolation issues
+      EXAMPLE=$(sed "s|CLAUDE_DIR|${CLAUDE_DIR}|g" "$SCRIPT_DIR/settings.example.json")
+      node -e "
+        const fs = require('fs');
+        const settingsPath = process.argv[1];
+        const existing = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+        const incoming = JSON.parse(process.argv[2]);
+
+        if (!existing.hooks) existing.hooks = {};
+        if (!existing.hooks.PreToolUse) existing.hooks.PreToolUse = [];
+        if (!existing.hooks.PostToolUse) existing.hooks.PostToolUse = [];
+
+        const existingIds = new Set([
+          ...existing.hooks.PreToolUse.map(h => h.id).filter(Boolean),
+          ...existing.hooks.PostToolUse.map(h => h.id).filter(Boolean),
+        ]);
+
+        let added = 0;
+        for (const hook of (incoming.hooks.PreToolUse || [])) {
+          if (!existingIds.has(hook.id)) {
+            existing.hooks.PreToolUse.push(hook);
+            existingIds.add(hook.id);
+            added++;
+          }
+        }
+        for (const hook of (incoming.hooks.PostToolUse || [])) {
+          if (!existingIds.has(hook.id)) {
+            existing.hooks.PostToolUse.push(hook);
+            existingIds.add(hook.id);
+            added++;
+          }
+        }
+
+        fs.writeFileSync(settingsPath, JSON.stringify(existing, null, 2) + '\n');
+        console.log('  -> Merged ' + added + ' hook(s) into ' + settingsPath);
+      " "$SETTINGS" "$EXAMPLE"
+    else
+      echo ""
+      echo "  Skipped. To add hooks manually, see settings.example.json or profiles/."
+      echo "  You can re-run the installer later to merge."
+    fi
   fi
 fi
 
-echo "[5/5] Verifying hook scripts..."
+echo "[5/7] CLAUDE.md template..."
+# Offer to copy the behavioral template — never overwrite an existing CLAUDE.md
+if [ -n "${PROJECT_DIR:-}" ] && [ -d "$PROJECT_DIR" ]; then
+  target="$PROJECT_DIR/CLAUDE.md"
+elif git rev-parse --show-toplevel &>/dev/null; then
+  target="$(git rev-parse --show-toplevel)/CLAUDE.md"
+else
+  target=""
+fi
+
+if [ -n "$target" ]; then
+  if [ -f "$target" ]; then
+    echo "  -> $target already exists — skipping (won't overwrite)"
+  else
+    read -rp "  Copy hardening CLAUDE.md template to $target? [y/N] " claude_answer
+    if [[ "$claude_answer" =~ ^[Yy]$ ]]; then
+      cp "$SCRIPT_DIR/templates/CLAUDE.md" "$target"
+      echo "  -> Copied to $target"
+    else
+      echo "  -> Skipped. Template available at templates/CLAUDE.md"
+    fi
+  fi
+else
+  echo "  -> No project directory detected. Template available at templates/CLAUDE.md"
+  echo "     Copy it manually: cp templates/CLAUDE.md /path/to/your/project/CLAUDE.md"
+fi
+
+echo "[6/7] Verifying hook scripts..."
 all_ok=true
-for hook in deny-destructive network-egress git-guard file-access secret-scan audit-log; do
+for hook in sandbox-exec deny-destructive network-egress git-guard file-access secret-scan audit-log; do
   if node --check "$HOOKS_DIR/${hook}.js" 2>/dev/null; then
     echo "  -> ${hook}.js OK"
   else
@@ -106,6 +186,16 @@ if [ "$all_ok" = false ]; then
   echo ""
   echo "ERROR: One or more hooks have syntax errors. Check Node.js version."
   exit 1
+fi
+
+echo "[7/7] Sandbox status..."
+if [ "$BWRAP_AVAILABLE" = true ]; then
+  echo "  -> bwrap sandbox: ACTIVE"
+  echo "  -> Sandbox mode: standard (configure in $FILE_POLICY)"
+  echo "  -> Change to strict mode for read-only filesystem protection"
+else
+  echo "  -> bwrap sandbox: INACTIVE (install bubblewrap to enable)"
+  echo "  -> Regex-based file-access protection is still active"
 fi
 
 echo ""

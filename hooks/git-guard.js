@@ -15,6 +15,30 @@
 
 'use strict';
 
+const { spawnSync } = require('child_process');
+
+/**
+ * Get the current git branch. Returns null if not in a git repo or on a
+ * detached HEAD. This runs as a direct subprocess — it does NOT go through
+ * Claude Code's hook system, so there is no recursion risk.
+ */
+function getCurrentBranch() {
+  try {
+    const result = spawnSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 3000,
+    });
+    if (result.status === 0) {
+      const branch = result.stdout.trim();
+      return branch === 'HEAD' ? null : branch; // detached HEAD
+    }
+  } catch {
+    // not in a git repo
+  }
+  return null;
+}
+
 const MAX_STDIN = 1024 * 1024;
 let data = '';
 process.stdin.setEncoding('utf8');
@@ -55,11 +79,10 @@ process.stdin.on('end', () => {
     },
     {
       pattern: /\bgit\s+commit\b/,
-      desc: 'git commit on protected branch',
-      advice: 'If you are on main/master, switch to a feature branch first:\n' +
+      desc: 'git commit on main/master',
+      advice: 'Switch to a feature branch first:\n' +
               '  git checkout -b your-branch-name\n' +
               'Or run it yourself if a direct commit to main is intentional:\n',
-      // Only block if currently on main/master — checked dynamically below
       checkBranch: true,
     },
     {
@@ -71,25 +94,22 @@ process.stdin.on('end', () => {
   ];
 
   for (const rule of rules) {
-    // For commit, we need to check the current branch — but we can't run git
-    // from within the hook without risk of recursion. Instead, we check if the
-    // command itself specifies a branch explicitly (e.g. `git commit -m "..."`)
-    // and let it through. The advice message covers the case.
     if (rule.checkBranch) {
-      // Only intercept if the command looks like a plain commit (not amend to
-      // a historical ref, not --no-commit, etc.) — still allow but warn.
-      if (!/\bgit\s+commit\b/.test(normalized)) continue;
-      // We warn rather than hard-block for commits, since we can't know the
-      // current branch without running a subprocess.
-      process.stderr.write(
-        '[git-guard] NOTICE: git commit detected\n' +
-        'If you are on main/master, create a feature branch first:\n' +
-        '  git checkout -b your-branch-name\n' +
-        'If you are already on a feature branch, this message is informational only.\n' +
-        'To proceed on main (if intentional), run it yourself:\n' +
-        '  ! ' + cmd.substring(0, 300) + '\n'
-      );
-      process.exit(2);
+      if (!rule.pattern.test(normalized)) continue;
+      // Check actual branch — only block on main/master
+      const branch = getCurrentBranch();
+      if (branch === 'main' || branch === 'master') {
+        process.stderr.write(
+          '[git-guard] STOPPED: ' + rule.desc + '\n' +
+          'Command: ' + cmd.substring(0, 200) + '\n' +
+          'Currently on branch: ' + branch + '\n' +
+          rule.advice +
+          '  ! ' + cmd.substring(0, 300) + '\n'
+        );
+        process.exit(2);
+      }
+      // On a feature branch or detached HEAD — pass through
+      continue;
     }
 
     if (rule.pattern && rule.pattern.test(normalized)) {

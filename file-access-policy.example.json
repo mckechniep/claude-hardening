@@ -1,6 +1,8 @@
 {
   "_comment": "File access policy for claude-hardening. Changes take effect immediately — no restart needed.",
 
+  "sandboxMode": "standard",
+
   "blockedDirs": [
     ".vault",
     "secrets"
@@ -14,5 +16,12 @@
 
   "allowedPaths": [
     "~/.ssh/known_hosts"
+  ],
+
+  "writablePaths": [
+    "/tmp",
+    "$HOME/.cache",
+    "$HOME/.npm",
+    "$HOME/.local"
   ]
 }

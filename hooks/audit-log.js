@@ -25,6 +25,7 @@ const path = require('path');
 const os = require('os');
 
 const LOG_PATH = path.join(os.homedir(), '.claude', 'audit.log');
+const MAX_LOG_SIZE = 10 * 1024 * 1024; // 10MB — rotate when exceeded
 const MAX_STDIN = 1024 * 1024;
 
 let data = '';
@@ -65,6 +66,17 @@ process.stdin.on('end', () => {
   }
 
   try {
+    // Rotate if log exceeds size limit: rename current to .1, start fresh
+    try {
+      const stat = fs.statSync(LOG_PATH);
+      if (stat.size > MAX_LOG_SIZE) {
+        const rotated = LOG_PATH + '.1';
+        try { fs.unlinkSync(rotated); } catch { /* no previous rotation */ }
+        fs.renameSync(LOG_PATH, rotated);
+      }
+    } catch {
+      // Log file doesn't exist yet — that's fine
+    }
     fs.appendFileSync(LOG_PATH, JSON.stringify(entry) + '\n', 'utf8');
   } catch {
     // Silently fail — never block the agent due to a logging failure

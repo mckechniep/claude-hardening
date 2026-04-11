@@ -8,9 +8,19 @@
 
 ## What it does
 
-Six hooks that intercept tool calls before or after the agent executes them:
+Seven hooks that intercept tool calls before or after the agent executes them:
 
 ### PreToolUse hooks
+
+**sandbox-exec** — wraps Bash commands in a bubblewrap (bwrap) sandbox
+
+| Mode | Behavior |
+|---|---|
+| `standard` (default) | Filesystem is read-write. Credential directories (`.ssh`, `.aws`, `.gnupg`, etc.) are replaced with empty tmpfs overlays. The agent can work normally but cannot access sensitive files regardless of how the command is structured — variable expansion, encoding, subshells, and aliasing are all ineffective because protection is at the OS level, not regex. |
+| `strict` | Filesystem is read-only by default. Only `writablePaths` (+ the project directory) are writable. Credential directories are still hidden. Disguised destructive commands like `rm -rf ~` hit a read-only filesystem and fail. |
+
+Falls back to regex-based protection when bwrap is not available.
+Config: `~/.claude/file-access-policy.json` (`sandboxMode`, `writablePaths`)
 
 **deny-destructive** — blocks dangerous shell commands
 
@@ -50,7 +60,7 @@ Six hooks that intercept tool calls before or after the agent executes them:
 | `.netrc`, `.git-credentials`, `.npmrc`, `.pypirc` | Blocked |
 | Normal project files | Pass through |
 
-Applies to **Read, Write, Edit, and Glob** tool calls.
+Applies to **Bash, Read, Write, Edit, and Glob** tool calls. For Bash, extracts file paths from common commands (`cat`, `head`, `tail`, `cp`, `mv`, etc.) as a regex fallback when bwrap is unavailable.
 Config: `~/.claude/file-access-policy.json`
 
 **secret-scan** — scans file content before it is written to disk
@@ -87,13 +97,15 @@ cd claude-hardening
 ```
 
 The installer:
-1. Copies all six hook scripts to `~/.claude/scripts/hooks/`
-2. Creates `~/.claude/network-allowlist.json` (won't overwrite if it exists)
-3. Creates `~/.claude/file-access-policy.json` (won't overwrite if it exists)
-4. Configures `~/.claude/settings.json` (or prints manual instructions if the file already exists)
-5. Syntax-checks each hook with Node.js
+1. Checks for Node.js 18+ and bubblewrap (bwrap)
+2. Copies all seven hook scripts to `~/.claude/scripts/hooks/`
+3. Creates `~/.claude/network-allowlist.json` and `~/.claude/file-access-policy.json` (won't overwrite)
+4. Configures `~/.claude/settings.json` — offers to **merge** hooks if the file already exists (backs up first, deduplicates by hook id)
+5. Offers to copy the `CLAUDE.md` template to your project (never overwrites)
+6. Syntax-checks each hook with Node.js
+7. Reports sandbox status (active if bwrap available, regex fallback if not)
 
-Requires Node.js 18+.
+Requires Node.js 18+. Bubblewrap recommended: `sudo apt install bubblewrap`
 
 ## Verify
 
@@ -101,29 +113,30 @@ Requires Node.js 18+.
 npm test
 ```
 
-Runs 32 tests covering every hook — pass/fail rules, edge cases, and allow-list behavior.
+Runs 44 tests covering every hook — sandbox rewrites, pass/fail rules, edge cases, and allow-list behavior.
 
 ## Files
 
 ```
 claude-hardening/
 ├── hooks/
+│   ├── sandbox-exec.js              # bwrap sandbox (OS-level filesystem protection)
 │   ├── deny-destructive.js          # Destructive shell command deny list
 │   ├── network-egress.js            # Network egress allowlist control
 │   ├── git-guard.js                 # Git branch protection
-│   ├── file-access.js               # Sensitive file path protection
+│   ├── file-access.js               # Sensitive file path protection (+ Bash fallback)
 │   ├── secret-scan.js               # Credential pattern detection
 │   └── audit-log.js                 # Session audit trail (PostToolUse)
 ├── profiles/
-│   ├── standard.json                # All hooks — good default
-│   ├── strict.json                  # All hooks + Read in audit log
+│   ├── standard.json                # All hooks, sandbox in standard mode
+│   ├── strict.json                  # All hooks, sandbox in strict mode + Read audit
 │   └── readonly.json                # Blocks all Bash and file writes
 ├── templates/
 │   └── CLAUDE.md                    # Behavioral guardrails for agents
 ├── tests/
-│   └── run-tests.js                 # 32 tests across all hooks
+│   └── run-tests.js                 # 44 tests across all hooks
 ├── network-allowlist.example.json   # Default trusted domains
-├── file-access-policy.example.json  # File access policy template
+├── file-access-policy.example.json  # File access + sandbox policy template
 ├── settings.example.json            # Example settings.json with all hooks
 ├── package.json                     # npm test entry point
 └── install.sh                       # Installer script
@@ -134,6 +147,7 @@ After install, your `~/.claude/` will contain:
 ```
 ~/.claude/
 ├── scripts/hooks/
+│   ├── sandbox-exec.js
 │   ├── deny-destructive.js
 │   ├── network-egress.js
 │   ├── git-guard.js
@@ -150,11 +164,11 @@ After install, your `~/.claude/` will contain:
 
 Pre-built permission levels in `profiles/`:
 
-| Profile | Bash | Writes | Network | File reads | Audit |
-|---|---|---|---|---|---|
-| `standard.json` | Guarded | Secret-scanned | Allowlisted | Sensitive blocked | Yes |
-| `strict.json` | Guarded | Secret-scanned | Allowlisted | Sensitive blocked | Yes (incl. reads) |
-| `readonly.json` | Blocked | Blocked | — | Sensitive blocked | No |
+| Profile | Sandbox | Bash | Writes | Network | File reads | Audit |
+|---|---|---|---|---|---|---|
+| `standard.json` | Standard (credential dirs hidden) | Guarded | Secret-scanned | Allowlisted | Sensitive blocked | Yes |
+| `strict.json` | Strict (read-only base) | Guarded | Secret-scanned | Allowlisted | Sensitive blocked | Yes (incl. reads) |
+| `readonly.json` | — | Blocked | Blocked | — | Sensitive blocked | No |
 
 To apply a profile, merge its contents into `~/.claude/settings.json`.
 
@@ -188,12 +202,13 @@ Edit `~/.claude/network-allowlist.json` to add trusted domains:
 
 Changes take effect immediately — no restart needed. Subdomains are matched automatically: adding `github.com` also allows `api.github.com`.
 
-## Customizing file access
+## Customizing file access and sandbox
 
-Edit `~/.claude/file-access-policy.json` to extend or override the defaults:
+Edit `~/.claude/file-access-policy.json` to configure both the file-access hook and the sandbox:
 
 ```json
 {
+  "sandboxMode": "standard",
   "blockedDirs": [
     ".vault",
     "secrets"
@@ -203,13 +218,29 @@ Edit `~/.claude/file-access-policy.json` to extend or override the defaults:
   ],
   "allowedPaths": [
     "~/.ssh/known_hosts"
+  ],
+  "writablePaths": [
+    "/tmp",
+    "$HOME/.cache",
+    "$HOME/.npm",
+    "$HOME/.local"
   ]
 }
 ```
 
+- `sandboxMode` — `"standard"` (credential dirs hidden, filesystem read-write) or `"strict"` (read-only base, only `writablePaths` are writable)
 - `blockedDirs` — additional directories to block (relative to `~` or absolute)
 - `blockedFiles` — additional filename regex patterns to block
 - `allowedPaths` — explicit escape hatch for paths you intentionally need access to
+- `writablePaths` — directories the agent can write to in strict mode (the project directory is always writable). Supports `$HOME` and `~` prefixes.
+
+### Sandbox modes explained
+
+**Standard** — the agent can read and write freely. Credential directories (`~/.ssh`, `~/.aws`, etc.) are replaced with empty tmpfs overlays so they appear empty to any command, regardless of how it's invoked.
+
+**Strict** — the entire filesystem is mounted read-only. Only the project directory and paths in `writablePaths` are writable. A disguised `rm -rf ~` hits a read-only filesystem and fails. Credential dirs are still hidden via tmpfs.
+
+Both modes are enforced at the OS level via bubblewrap. Shell indirection, variable expansion, base64 encoding, and subshell tricks cannot bypass the sandbox.
 
 ## When commands get blocked
 
@@ -238,32 +269,49 @@ mv ~/.claude/network-allowlist.json.disabled ~/.claude/network-allowlist.json
 
 ## Coverage and limitations
 
-| Threat | Covered |
-|---|---|
-| Recursive filesystem deletion | Yes |
-| Privilege escalation (sudo) | Yes |
-| Destructive git operations | Yes |
-| Direct commits to main/master | Yes |
-| Data exfiltration via curl/wget | Yes |
-| Raw socket connections (netcat) | Yes |
-| SSH/SCP to unknown hosts | Yes |
-| Dynamic/variable URLs | Yes |
-| Fork bombs / disk destruction | Yes |
-| Reading credential files (.ssh, .aws, .env) | Yes |
-| Writing secrets / API keys to files | Yes |
-| Session audit trail | Yes |
-| DNS tunneling | No |
-| Obfuscated/aliased commands | Partial |
-| Non-shell exfiltration via MCP tools | No |
-| Secrets leaked through stdout/response | No |
+| Threat | Covered | How |
+|---|---|---|
+| Recursive filesystem deletion | Yes | deny-destructive (regex) + sandbox-exec (strict mode: read-only FS) |
+| Privilege escalation (sudo) | Yes | deny-destructive |
+| Destructive git operations | Yes | deny-destructive + git-guard |
+| Direct commits to main/master | Yes | git-guard |
+| Data exfiltration via curl/wget | Yes | network-egress |
+| Raw socket connections (netcat) | Yes | network-egress |
+| SSH/SCP to unknown hosts | Yes | network-egress |
+| Dynamic/variable URLs | Yes | network-egress |
+| Fork bombs / disk destruction | Yes | deny-destructive |
+| Reading credential files (.ssh, .aws, .env) | Yes | **sandbox-exec** (OS-level) + file-access (regex fallback) |
+| Shell indirection to read credentials | Yes | **sandbox-exec** (OS-level — immune to encoding, variables, subshells) |
+| Disguised destructive writes | Yes (strict) | **sandbox-exec** strict mode (read-only filesystem) |
+| Writing secrets / API keys to files | Yes | secret-scan |
+| Session audit trail | Yes | audit-log |
+| DNS tunneling | No | — |
+| Non-shell exfiltration via MCP tools | No | — |
+| Secrets leaked through stdout/response | No | — |
 
-These hooks inspect the command string and file path/content, not the shell execution environment. Sophisticated evasion through aliasing, encoding, or subshell tricks is possible but raises the bar significantly against prompt injection attacks.
+The sandbox hook (`sandbox-exec.js`) operates at the OS level via bubblewrap, making it immune to shell indirection attacks (base64 encoding, variable expansion, subshells, aliasing). The other hooks use regex-based text analysis — effective against unintentional leaks and basic prompt injection, but bypassable by sophisticated evasion. Both layers run together for defense in depth.
+
+## Roadmap
+
+Ideas under consideration for future releases:
+
+### v0.2.0
+
+**Rate limiting** — detect repeated blocked attempts within a session. If an agent hammers a blocked command pattern (e.g., retrying `sudo` or probing different exfiltration domains), escalate from a per-call block to a session-level warning or halt. Useful for catching prompt injection loops that brute-force past individual denials.
+
+**MCP tool interception** — extend hook coverage beyond Bash and file tools to MCP server tool calls. Currently, an agent could use an MCP tool (e.g., a database connector or HTTP client) to exfiltrate data without triggering network-egress or file-access hooks. This would add a configurable matcher layer for MCP tool names and their parameters.
+
+**Obfuscation detection** — catch base64-encoded commands (`echo dW5hbWU= | base64 -d | sh`), hex-encoded payloads, and multi-stage shell evasion patterns. The current deny-destructive hook inspects the literal command string, which means encoded or aliased invocations can bypass it.
+
+**Audit log viewer** — a CLI command (`npx claude-hardening audit`) that parses `~/.claude/audit.log` and outputs a human-readable summary: commands run, files touched, blocks triggered, session timeline. Makes post-session review practical without manually reading JSONL.
+
+**CI integration** — a test harness that runs the full hook suite in CI (GitHub Actions, etc.) so that changes to hook logic or allowlists are validated before deployment. Includes a matrix of known-good and known-bad inputs for regression testing.
 
 ## Uninstall
 
 ```bash
 cd ~/.claude/scripts/hooks/
-rm deny-destructive.js network-egress.js git-guard.js file-access.js secret-scan.js audit-log.js
+rm sandbox-exec.js deny-destructive.js network-egress.js git-guard.js file-access.js secret-scan.js audit-log.js
 rm ~/.claude/network-allowlist.json
 rm ~/.claude/file-access-policy.json
 ```
