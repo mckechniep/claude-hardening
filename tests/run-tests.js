@@ -306,6 +306,36 @@ test('blocks write of .pem file', () => {
   assert(r.exitCode === 2, `expected exit 2, got ${r.exitCode}`);
 });
 
+test('blocks read of tokens.json', () => {
+  const r = runHook('file-access.js', makeInput('Read', { file_path: '/project/tokens.json' }));
+  assert(r.exitCode === 2, `expected exit 2, got ${r.exitCode}`);
+});
+
+test('blocks read of secret.yaml', () => {
+  const r = runHook('file-access.js', makeInput('Read', { file_path: '/project/secret.yaml' }));
+  assert(r.exitCode === 2, `expected exit 2, got ${r.exitCode}`);
+});
+
+test('allows write of tokens.css (design tokens)', () => {
+  const r = runHook('file-access.js', makeInput('Write', { file_path: '/project/styles/tokens.css', content: ':root { --color: red; }' }));
+  assert(r.exitCode === 0, `expected exit 0, got ${r.exitCode}`);
+});
+
+test('allows read of tokens.ts (source file)', () => {
+  const r = runHook('file-access.js', makeInput('Read', { file_path: '/project/src/tokens.ts' }));
+  assert(r.exitCode === 0, `expected exit 0, got ${r.exitCode}`);
+});
+
+test('allows read of secrets.js (source file)', () => {
+  const r = runHook('file-access.js', makeInput('Read', { file_path: '/project/src/secrets.js' }));
+  assert(r.exitCode === 0, `expected exit 0, got ${r.exitCode}`);
+});
+
+test('allows read of apikeys.py (source file)', () => {
+  const r = runHook('file-access.js', makeInput('Read', { file_path: '/project/src/apikeys.py' }));
+  assert(r.exitCode === 0, `expected exit 0, got ${r.exitCode}`);
+});
+
 test('allows read of normal source file', () => {
   const r = runHook('file-access.js', makeInput('Read', { file_path: '/project/src/index.js' }));
   assert(r.exitCode === 0, `expected exit 0, got ${r.exitCode}`);

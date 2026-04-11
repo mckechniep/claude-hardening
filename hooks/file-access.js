@@ -41,11 +41,12 @@ const DEFAULT_BLOCKED_DIRS = [
 const DEFAULT_BLOCKED_FILES = [
   // Env files
   /^\.env(\.|$)/,
-  // Credential filenames (anchored to avoid matching source files like TokenService.ts)
-  /^\.?(credentials|creds)(\..+)?$/i,
-  /^\.?(secrets?)(\..+)?$/i,
-  /^\.?(tokens?|auth[_-]tokens?)(\..+)?$/i,
-  /^\.?(api[_-]?keys?)(\..+)?$/i,
+  // Credential filenames — restricted to config/data extensions to avoid
+  // false positives on source files (e.g. tokens.css, secrets.ts, apikeys.py)
+  /^\.?(credentials|creds)(\.(json|ya?ml|env|txt|cfg|conf|ini|toml|xml))?$/i,
+  /^\.?(secrets?)(\.(json|ya?ml|env|txt|cfg|conf|ini|toml|xml))?$/i,
+  /^\.?(tokens?|auth[_-]tokens?)(\.(json|ya?ml|env|txt|cfg|conf|ini|toml|xml))?$/i,
+  /^\.?(api[_-]?keys?)(\.(json|ya?ml|env|txt|cfg|conf|ini|toml|xml))?$/i,
   // Certificate and key files
   /\.pem$/i,
   /\.key$/i,

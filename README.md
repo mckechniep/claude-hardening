@@ -59,7 +59,7 @@ Config: `~/.claude/file-access-policy.json` (`sandboxMode`, `writablePaths`)
 | `~/.ssh/`, `~/.aws/`, `~/.gnupg/`, `~/.kube/` | Blocked |
 | `.env`, `.env.*`, `.env.local` | Blocked |
 | `*.pem`, `*.key`, `*.p12`, `*.pfx` | Blocked |
-| Files named `credentials`, `secret`, `token`, `apikey` (+ plurals, with any extension) | Blocked |
+| Files named `credentials`, `secret`, `token`, `apikey` (+ plurals, with config extensions: `.json`, `.yaml`, `.env`, `.txt`, `.cfg`, `.conf`, `.ini`, `.toml`, `.xml`) | Blocked |
 | `/etc/passwd`, `/etc/shadow`, `/etc/sudoers` | Blocked |
 | `.netrc`, `.git-credentials`, `.npmrc`, `.pypirc` | Blocked |
 | Normal project files | Pass through |
