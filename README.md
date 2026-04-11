@@ -34,18 +34,22 @@ Config: `~/.claude/file-access-policy.json` (`sandboxMode`, `writablePaths`)
 | What | Behavior |
 |---|---|
 | `curl`/`wget` to unknown domains | Blocked — prevents data exfiltration |
+| `ftp`/`ftps`/`sftp` URLs | Blocked — same as http/https |
 | `nc`/`ncat`/`netcat` | Blocked unless target domain is on allowlist |
 | `ssh`/`scp`/`rsync` to unknown hosts | Blocked |
+| `git clone`/`fetch`/`pull`/`push` to unknown hosts | Blocked |
 | Dynamic/variable URLs (`curl $URL`) | Blocked — destination can't be verified |
+| No allowlist file | All external blocked, localhost still allowed |
 | Requests to allowlisted domains | Passes through normally |
 | localhost / 127.0.0.1 | Always allowed |
 
-**git-guard** — warns on direct commits or pushes to main/master
+**git-guard** — blocks commits and pushes to main/master
 
 | What | Behavior |
 |---|---|
 | `git push origin main` | Blocked — redirected to feature branch |
-| `git commit` (any) | Stopped with branch-check reminder |
+| `git commit` on main/master | Blocked — checks actual branch via `git rev-parse` |
+| `git commit` on feature branch | Passes through normally |
 | `git branch -D main` | Blocked — deleting primary branch |
 
 **file-access** — blocks reads and writes to sensitive files
@@ -55,7 +59,7 @@ Config: `~/.claude/file-access-policy.json` (`sandboxMode`, `writablePaths`)
 | `~/.ssh/`, `~/.aws/`, `~/.gnupg/`, `~/.kube/` | Blocked |
 | `.env`, `.env.*`, `.env.local` | Blocked |
 | `*.pem`, `*.key`, `*.p12`, `*.pfx` | Blocked |
-| Files matching `credentials`, `secret`, `token`, `apikey` | Blocked |
+| Files named `credentials`, `secret`, `token`, `apikey` (+ plurals, with any extension) | Blocked |
 | `/etc/passwd`, `/etc/shadow`, `/etc/sudoers` | Blocked |
 | `.netrc`, `.git-credentials`, `.npmrc`, `.pypirc` | Blocked |
 | Normal project files | Pass through |
@@ -81,7 +85,7 @@ Applies to **Write and Edit** tool calls.
 
 ### PostToolUse hooks
 
-**audit-log** — appends a JSONL entry to `~/.claude/audit.log` for every Bash command and file write. Never blocks — silent observer only.
+**audit-log** — appends a JSONL entry to `~/.claude/audit.log` for every Bash command and file write. Rotates at 10MB (renames to `audit.log.1`). Never blocks — silent observer only.
 
 ```json
 {"ts":"2026-04-06T15:00:00.000Z","tool":"Bash","command":"git status","exit":0}
@@ -113,7 +117,7 @@ Requires Node.js 18+. Bubblewrap recommended: `sudo apt install bubblewrap`
 npm test
 ```
 
-Runs 44 tests covering every hook — sandbox rewrites, pass/fail rules, edge cases, and allow-list behavior.
+Runs 55 tests covering every hook — sandbox rewrites, pass/fail rules, edge cases, and allow-list behavior.
 
 ## Files
 
@@ -134,12 +138,13 @@ claude-hardening/
 ├── templates/
 │   └── CLAUDE.md                    # Behavioral guardrails for agents
 ├── tests/
-│   └── run-tests.js                 # 44 tests across all hooks
+│   └── run-tests.js                 # 55 tests across all hooks
 ├── network-allowlist.example.json   # Default trusted domains
 ├── file-access-policy.example.json  # File access + sandbox policy template
 ├── settings.example.json            # Example settings.json with all hooks
 ├── package.json                     # npm test entry point
-└── install.sh                       # Installer script
+├── install.sh                       # Installer script
+└── uninstall.sh                     # Uninstaller (restores pre-install state)
 ```
 
 After install, your `~/.claude/` will contain:
@@ -258,14 +263,11 @@ Add to ~/.claude/network-allowlist.json if trusted, or run it yourself:
 
 ## Temporarily disabling
 
-**Network egress only:** rename the allowlist file. The hook passes through safely when the file is missing:
-```bash
-mv ~/.claude/network-allowlist.json ~/.claude/network-allowlist.json.disabled
-# ... do work ...
-mv ~/.claude/network-allowlist.json.disabled ~/.claude/network-allowlist.json
-```
+**Network egress:** add the domain you need to `~/.claude/network-allowlist.json`. Do not delete the file — a missing allowlist blocks all external traffic (localhost still works).
 
-**All hooks:** remove the hook entries from `~/.claude/settings.json`.
+**Single hook:** remove that hook's entry from `~/.claude/settings.json`. Re-run `./install.sh` later to re-add it (the merge is idempotent).
+
+**All hooks:** run `./uninstall.sh` and re-install later with `./install.sh`.
 
 ## Coverage and limitations
 
@@ -310,13 +312,18 @@ Ideas under consideration for future releases:
 ## Uninstall
 
 ```bash
-cd ~/.claude/scripts/hooks/
-rm sandbox-exec.js deny-destructive.js network-egress.js git-guard.js file-access.js secret-scan.js audit-log.js
-rm ~/.claude/network-allowlist.json
-rm ~/.claude/file-access-policy.json
+cd claude-hardening
+./uninstall.sh
 ```
 
-Then remove the hook entries from `~/.claude/settings.json`.
+The uninstaller:
+1. Removes all 7 hook scripts from `~/.claude/scripts/hooks/`
+2. Restores `settings.json` from the backup created during install (or surgically removes just the hardening hooks if no backup exists, preserving your other settings)
+3. Asks whether to remove config files (`network-allowlist.json`, `file-access-policy.json`)
+4. Asks whether to remove audit logs
+5. Asks whether to remove backup files
+
+Every step asks before deleting. Your `settings.json` is backed up again before the restore, so you can always undo.
 
 ## License
 
