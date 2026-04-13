@@ -514,6 +514,265 @@ test('passes through on empty command', () => {
   assert(r.exitCode === 0, `expected exit 0, got ${r.exitCode}`);
 });
 
+function runHookWithPolicy(hookFile, inputJson, policyPath) {
+  const result = spawnSync('node', [path.join(HOOKS_DIR, hookFile)], {
+    input: inputJson,
+    encoding: 'utf8',
+    timeout: 5000,
+    env: { ...process.env, CLAUDE_HARDENING_POLICY: policyPath },
+  });
+  return {
+    exitCode: result.status,
+    stderr: result.stderr || '',
+    stdout: result.stdout || '',
+  };
+}
+
+test('resolves symlinked blocked dir to real target (WSL2 case)', () => {
+  if (!bwrapWorks) skip('(bwrap not available)');
+
+  const stamp = Date.now();
+  const target = path.join(os.tmpdir(), `hardening-symlink-target-${stamp}`);
+  const link = path.join(os.tmpdir(), `hardening-symlink-link-${stamp}`);
+  const policyFile = path.join(os.tmpdir(), `hardening-symlink-policy-${stamp}.json`);
+  fs.mkdirSync(target);
+  fs.symlinkSync(target, link);
+  fs.writeFileSync(policyFile, JSON.stringify({
+    sandboxMode: 'standard',
+    blockedDirs: [link],
+  }));
+
+  try {
+    const r = runHookWithPolicy('sandbox-exec.js',
+      makeInput('Bash', { command: 'ls' }), policyFile);
+    assert(r.exitCode === 0, `expected exit 0, got ${r.exitCode}`);
+    const output = JSON.parse(r.stdout);
+    const cmd = output.tool_input.command;
+    assert(cmd.includes(`--tmpfs ${target}`),
+      `expected tmpfs on resolved target ${target}, got: ${cmd}`);
+  } finally {
+    try { fs.unlinkSync(link); } catch {}
+    try { fs.rmdirSync(target); } catch {}
+    try { fs.unlinkSync(policyFile); } catch {}
+  }
+});
+
+test('dedups blocked dirs resolving to same real target', () => {
+  if (!bwrapWorks) skip('(bwrap not available)');
+
+  const stamp = Date.now();
+  const target = path.join(os.tmpdir(), `hardening-dedup-target-${stamp}`);
+  const link1 = path.join(os.tmpdir(), `hardening-dedup-link1-${stamp}`);
+  const link2 = path.join(os.tmpdir(), `hardening-dedup-link2-${stamp}`);
+  const policyFile = path.join(os.tmpdir(), `hardening-dedup-policy-${stamp}.json`);
+  fs.mkdirSync(target);
+  fs.symlinkSync(target, link1);
+  fs.symlinkSync(target, link2);
+  fs.writeFileSync(policyFile, JSON.stringify({
+    sandboxMode: 'standard',
+    blockedDirs: [link1, link2, target],
+  }));
+
+  try {
+    const r = runHookWithPolicy('sandbox-exec.js',
+      makeInput('Bash', { command: 'ls' }), policyFile);
+    const output = JSON.parse(r.stdout);
+    const cmd = output.tool_input.command;
+    const escaped = target.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const matches = cmd.match(new RegExp(`--tmpfs ${escaped}(?=\\s|$)`, 'g')) || [];
+    assert(matches.length === 1,
+      `expected 1 tmpfs entry for ${target}, got ${matches.length} in: ${cmd}`);
+  } finally {
+    try { fs.unlinkSync(link1); } catch {}
+    try { fs.unlinkSync(link2); } catch {}
+    try { fs.rmdirSync(target); } catch {}
+    try { fs.unlinkSync(policyFile); } catch {}
+  }
+});
+
+test('broken symlink in blockedDirs is silently skipped', () => {
+  if (!bwrapWorks) skip('(bwrap not available)');
+
+  const stamp = Date.now();
+  const missingTarget = path.join(os.tmpdir(), `hardening-missing-${stamp}`);
+  const brokenLink = path.join(os.tmpdir(), `hardening-broken-${stamp}`);
+  const policyFile = path.join(os.tmpdir(), `hardening-broken-policy-${stamp}.json`);
+  fs.symlinkSync(missingTarget, brokenLink);
+  fs.writeFileSync(policyFile, JSON.stringify({
+    sandboxMode: 'standard',
+    blockedDirs: [brokenLink],
+  }));
+
+  try {
+    const r = runHookWithPolicy('sandbox-exec.js',
+      makeInput('Bash', { command: 'ls' }), policyFile);
+    assert(r.exitCode === 0, `expected exit 0 (hook always passes), got ${r.exitCode}`);
+    const output = JSON.parse(r.stdout);
+    const cmd = output.tool_input.command;
+    assert(!cmd.includes(brokenLink) && !cmd.includes(missingTarget),
+      `broken symlink should not appear in bwrap args: ${cmd}`);
+  } finally {
+    try { fs.unlinkSync(brokenLink); } catch {}
+    try { fs.unlinkSync(policyFile); } catch {}
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// file-access.js — symlink resolution (WSL2 /mnt/c bypass)
+// ─────────────────────────────────────────────────────────────────────────────
+
+console.log('\nfile-access.js (symlink resolution)');
+
+test('blocks read via symlink-target path with benign filename', () => {
+  const stamp = Date.now();
+  const target = path.join(os.tmpdir(), `fa-target-${stamp}`);
+  const link = path.join(os.tmpdir(), `fa-link-${stamp}`);
+  const policyFile = path.join(os.tmpdir(), `fa-policy-${stamp}.json`);
+  fs.mkdirSync(target);
+  fs.writeFileSync(path.join(target, 'config'), 'sensitive');
+  fs.symlinkSync(target, link);
+  fs.writeFileSync(policyFile, JSON.stringify({ blockedDirs: [link] }));
+
+  try {
+    const r = runHookWithPolicy('file-access.js',
+      makeInput('Read', { file_path: path.join(target, 'config') }),
+      policyFile);
+    assert(r.exitCode === 2,
+      `expected exit 2 (blocked by realpath), got ${r.exitCode}. stderr: ${r.stderr}`);
+  } finally {
+    try { fs.unlinkSync(path.join(target, 'config')); } catch {}
+    try { fs.unlinkSync(link); } catch {}
+    try { fs.rmdirSync(target); } catch {}
+    try { fs.unlinkSync(policyFile); } catch {}
+  }
+});
+
+test('blocks read via symlink path itself (regression)', () => {
+  const stamp = Date.now();
+  const target = path.join(os.tmpdir(), `fa-target2-${stamp}`);
+  const link = path.join(os.tmpdir(), `fa-link2-${stamp}`);
+  const policyFile = path.join(os.tmpdir(), `fa-policy2-${stamp}.json`);
+  fs.mkdirSync(target);
+  fs.writeFileSync(path.join(target, 'token.bin'), 'sensitive');
+  fs.symlinkSync(target, link);
+  fs.writeFileSync(policyFile, JSON.stringify({ blockedDirs: [link] }));
+
+  try {
+    const r = runHookWithPolicy('file-access.js',
+      makeInput('Read', { file_path: path.join(link, 'token.bin') }),
+      policyFile);
+    assert(r.exitCode === 2, `expected exit 2, got ${r.exitCode}`);
+  } finally {
+    try { fs.unlinkSync(path.join(target, 'token.bin')); } catch {}
+    try { fs.unlinkSync(link); } catch {}
+    try { fs.rmdirSync(target); } catch {}
+    try { fs.unlinkSync(policyFile); } catch {}
+  }
+});
+
+test('blocks write to nonexistent file under symlinked blocked dir', () => {
+  const stamp = Date.now();
+  const target = path.join(os.tmpdir(), `fa-target3-${stamp}`);
+  const link = path.join(os.tmpdir(), `fa-link3-${stamp}`);
+  const policyFile = path.join(os.tmpdir(), `fa-policy3-${stamp}.json`);
+  fs.mkdirSync(target);
+  fs.symlinkSync(target, link);
+  fs.writeFileSync(policyFile, JSON.stringify({ blockedDirs: [link] }));
+
+  try {
+    // file doesn't exist yet — parent does; realpath-of-parent fallback must kick in
+    const r = runHookWithPolicy('file-access.js',
+      makeInput('Write', {
+        file_path: path.join(target, 'new-secret.bin'),
+        content: 'x',
+      }),
+      policyFile);
+    assert(r.exitCode === 2,
+      `expected exit 2 for new file under symlink target, got ${r.exitCode}`);
+  } finally {
+    try { fs.unlinkSync(link); } catch {}
+    try { fs.rmdirSync(target); } catch {}
+    try { fs.unlinkSync(policyFile); } catch {}
+  }
+});
+
+test('allows file outside any blocked dir (symlink regression)', () => {
+  const stamp = Date.now();
+  const safeDir = path.join(os.tmpdir(), `fa-safe-${stamp}`);
+  const policyFile = path.join(os.tmpdir(), `fa-safe-policy-${stamp}.json`);
+  fs.mkdirSync(safeDir);
+  fs.writeFileSync(policyFile, JSON.stringify({ blockedDirs: [] }));
+
+  try {
+    const r = runHookWithPolicy('file-access.js',
+      makeInput('Read', { file_path: path.join(safeDir, 'readme.txt') }),
+      policyFile);
+    assert(r.exitCode === 0, `expected exit 0 for unrelated path, got ${r.exitCode}`);
+  } finally {
+    try { fs.rmdirSync(safeDir); } catch {}
+    try { fs.unlinkSync(policyFile); } catch {}
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// file-access.js — WSL2 user inference (auto-derives Windows-side blocklist)
+// ─────────────────────────────────────────────────────────────────────────────
+
+console.log('\nfile-access.js (WSL2 inference)');
+
+// Discover a WSL2 base from any existing symlinked default credential dir.
+// All inference tests skip when no such symlink exists.
+function discoverWslBase() {
+  const defaults = ['.azure', '.aws', '.ssh', '.docker', '.gnupg', '.kube', '.gcloud'];
+  for (const dir of defaults) {
+    try {
+      const real = fs.realpathSync(path.join(os.homedir(), dir));
+      const m = real.match(/^(\/mnt\/[a-z]\/Users\/[^/]+)(\/|$)/i);
+      if (m) return m[1];
+    } catch {}
+  }
+  return null;
+}
+
+test('WSL2 inference blocks Windows-side path for default dir not on WSL', () => {
+  const wslBase = discoverWslBase();
+  if (!wslBase) skip('(no WSL2 symlinked credential dir on this machine)');
+
+  // Pick a default-blocked dir that doesn't exist on WSL, so we know any
+  // block must come from inference (not from direct realpath of the symlink).
+  const target = path.join(wslBase, '.kube', 'config');
+  const r = runHook('file-access.js',
+    makeInput('Read', { file_path: target }));
+  assert(r.exitCode === 2,
+    `expected exit 2 (WSL2-inferred block) for ${target}, got ${r.exitCode}. stderr: ${r.stderr}`);
+});
+
+test('WSL2 inference blocks Windows-side path for default dir that exists on WSL', () => {
+  const wslBase = discoverWslBase();
+  if (!wslBase) skip('(no WSL2 symlinked credential dir on this machine)');
+
+  // .ssh exists on WSL but isn't a symlink — verify Windows-side equivalent
+  // also gets blocked via inference (not via .ssh's own realpath, since that
+  // resolves to the local /home/.../.ssh path).
+  const target = path.join(wslBase, '.ssh', 'id_rsa');
+  const r = runHook('file-access.js',
+    makeInput('Read', { file_path: target }));
+  assert(r.exitCode === 2,
+    `expected exit 2 (WSL2-inferred block) for ${target}, got ${r.exitCode}`);
+});
+
+test('WSL2 inference does NOT block unrelated /mnt/c paths', () => {
+  const wslBase = discoverWslBase();
+  if (!wslBase) skip('(no WSL2 symlinked credential dir on this machine)');
+
+  // A path under /mnt/c that's NOT under any default credential dir
+  const target = path.join(wslBase, 'Documents', 'readme.txt');
+  const r = runHook('file-access.js',
+    makeInput('Read', { file_path: target }));
+  assert(r.exitCode === 0,
+    `expected exit 0 for unrelated Windows path ${target}, got ${r.exitCode}`);
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // file-access.js — Bash path extraction (regex fallback)
 // ─────────────────────────────────────────────────────────────────────────────

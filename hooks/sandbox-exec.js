@@ -36,7 +36,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const POLICY_PATH = path.join(os.homedir(), '.claude', 'file-access-policy.json');
+const POLICY_PATH = process.env.CLAUDE_HARDENING_POLICY
+  || path.join(os.homedir(), '.claude', 'file-access-policy.json');
 const HOME = os.homedir();
 
 // Directories blocked in all modes (tmpfs overlay — appears empty)
@@ -162,42 +163,78 @@ function buildSandboxCommandSafe(originalCmd, policy) {
   parts.push('--dev', '/dev');
   parts.push('--proc', '/proc');
 
+  // Resolve symlinks to real targets and dedup before emitting mount args.
+  // Critical on WSL2 where credential dirs are often symlinked to /mnt/c/...
+  // (Azure CLI, gcloud, kubectl config shared with the Windows side). A tmpfs
+  // on the symlink path is a no-op once the kernel follows the link.
+  const tmpfsTargets = new Set();
+  const wslBases = new Set();
   for (const dir of blockedDirs) {
     try {
-      const lstat = fs.lstatSync(dir);
-      if (lstat.isSymbolicLink()) continue;
-      if (lstat.isDirectory()) {
-        parts.push('--tmpfs', shellQuote(dir));
+      const realDir = fs.realpathSync(dir);
+      if (fs.statSync(realDir).isDirectory()) {
+        tmpfsTargets.add(realDir);
+        const m = realDir.match(/^(\/mnt\/[a-z]\/Users\/[^/]+)(\/|$)/i);
+        if (m) wslBases.add(m[1]);
       }
+    } catch {
+      // broken symlink or missing — skip
+    }
+  }
+
+  // WSL2 inference: for each Windows user base discovered above, also tmpfs
+  // any DEFAULT_BLOCKED_DIRS that exist on the Windows side. bwrap requires
+  // the path to exist, so non-existent derived paths are silently skipped.
+  for (const base of wslBases) {
+    for (const dir of DEFAULT_BLOCKED_DIRS) {
+      const derived = path.join(base, dir);
+      try {
+        if (fs.statSync(derived).isDirectory()) {
+          tmpfsTargets.add(derived);
+        }
+      } catch {
+        // not present on Windows side either — no need to mount
+      }
+    }
+  }
+
+  for (const realDir of tmpfsTargets) {
+    parts.push('--tmpfs', shellQuote(realDir));
+  }
+
+  const roBindTargets = new Set();
+  for (const file of blockedFiles) {
+    try {
+      roBindTargets.add(fs.realpathSync(file));
     } catch {
       // skip
     }
   }
-
-  for (const file of blockedFiles) {
-    try {
-      const lstat = fs.lstatSync(file);
-      if (lstat.isSymbolicLink()) continue;
-      parts.push('--ro-bind', '/dev/null', shellQuote(file));
-    } catch {
-      // skip
-    }
+  for (const realFile of roBindTargets) {
+    parts.push('--ro-bind', '/dev/null', shellQuote(realFile));
   }
 
   const allowedPaths = Array.isArray(policy.allowedPaths) ? policy.allowedPaths : [];
+  const allowedDirs = new Set();
+  const allowedFiles = new Set();
   for (const allowed of allowedPaths) {
-    const resolved = allowed.replace(/^~/, HOME);
+    const expanded = allowed.replace(/^~/, HOME);
     try {
-      const lstat = fs.lstatSync(resolved);
-      if (lstat.isSymbolicLink()) continue;
-      if (lstat.isDirectory()) {
-        parts.push('--bind', shellQuote(resolved), shellQuote(resolved));
+      const realPath = fs.realpathSync(expanded);
+      if (fs.statSync(realPath).isDirectory()) {
+        allowedDirs.add(realPath);
       } else {
-        parts.push('--ro-bind', shellQuote(resolved), shellQuote(resolved));
+        allowedFiles.add(realPath);
       }
     } catch {
       // skip
     }
+  }
+  for (const d of allowedDirs) {
+    parts.push('--bind', shellQuote(d), shellQuote(d));
+  }
+  for (const f of allowedFiles) {
+    parts.push('--ro-bind', shellQuote(f), shellQuote(f));
   }
 
   parts.push('--', 'sh', '-c', shellQuote(originalCmd));

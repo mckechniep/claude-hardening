@@ -24,7 +24,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const POLICY_PATH = path.join(os.homedir(), '.claude', 'file-access-policy.json');
+const POLICY_PATH = process.env.CLAUDE_HARDENING_POLICY
+  || path.join(os.homedir(), '.claude', 'file-access-policy.json');
 
 // Built-in sensitive path patterns (always applied unless overridden)
 const DEFAULT_BLOCKED_DIRS = [
@@ -176,6 +177,26 @@ process.stdin.on('end', () => {
 
 // ── Path checking logic (shared by tool-path and bash-path branches) ──
 
+// Resolve symlinks; for non-existent files, resolve the parent and reattach.
+// The parent fallback matters for Write tool calls creating new files under
+// symlinked credential dirs (e.g. writing into ~/.azure/ when that's a
+// symlink to /mnt/c/.../.azure/ on WSL2).
+function realPathOrParent(p) {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    try {
+      return path.join(fs.realpathSync(path.dirname(p)), path.basename(p));
+    } catch {
+      return p;
+    }
+  }
+}
+
+function isUnderOrEqual(candidate, target) {
+  return candidate === target || candidate.startsWith(target + path.sep);
+}
+
 function checkPath(filePath) {
   // Load policy overrides if present
   let policy = {};
@@ -190,37 +211,68 @@ function checkPath(filePath) {
   const allowedPaths = Array.isArray(policy.allowedPaths) ? policy.allowedPaths : [];
 
   const resolved = path.resolve(filePath);
+  const realResolved = realPathOrParent(resolved);
   const basename = path.basename(resolved);
   const home = os.homedir();
 
-  // Check explicit allow list first (escape hatch for intentional access)
+  // Check explicit allow list first (escape hatch for intentional access).
+  // Matches against both literal and realpath'd forms so allow-by-symlink works.
   for (const allowed of allowedPaths) {
-    const resolvedAllowed = path.resolve(allowed.replace(/^~/, home));
-    if (resolved === resolvedAllowed || resolved.startsWith(resolvedAllowed + path.sep)) {
+    const absAllowed = path.resolve(allowed.replace(/^~/, home));
+    const realAllowed = realPathOrParent(absAllowed);
+    if (isUnderOrEqual(resolved, absAllowed) || isUnderOrEqual(realResolved, realAllowed)) {
       return 'allowed';
     }
   }
 
-  // Check absolute blocked paths
+  // Check absolute blocked paths (both literal and realpath'd input)
   const blockedAbsolute = [...DEFAULT_BLOCKED_ABSOLUTE, ...(policy.blockedAbsolute || [])];
   for (const blocked of blockedAbsolute) {
-    if (resolved === blocked) {
+    const realBlocked = realPathOrParent(blocked);
+    if (resolved === blocked || realResolved === blocked || realResolved === realBlocked) {
       block(filePath, `${basename} is a protected system file`);
       return 'blocked';
     }
   }
 
-  // Check blocked directory prefixes (relative to home or absolute)
+  // Check blocked directory prefixes. Resolve BOTH the input path and each
+  // blocklist dir to real targets, so symlinked credential dirs (common on
+  // WSL2 where ~/.azure → /mnt/c/.../.azure) are caught whether the agent
+  // supplies the symlink path or the Windows-side target path.
   const allBlockedDirs = [...DEFAULT_BLOCKED_DIRS, ...extraBlockedDirs];
+  const effectiveBlocked = [];
   for (const dir of allBlockedDirs) {
     const absDir = dir.startsWith('/') ? dir : path.join(home, dir);
-    if (resolved.startsWith(absDir + path.sep) || resolved === absDir) {
-      block(filePath, `path is inside protected directory: ~/${dir}`);
+    const realDir = realPathOrParent(absDir);
+    effectiveBlocked.push({ label: dir, abs: absDir, real: realDir });
+  }
+
+  // WSL2 inference: any blocked dir whose realpath sits under
+  // /mnt/<drive>/Users/<user>/ reveals the Windows-side base for this WSL2
+  // host. Auto-derive the same DEFAULT_BLOCKED_DIRS under that base so that
+  // tools installed on Windows only (no WSL symlink) are still protected.
+  const wslBases = new Set();
+  for (const { real } of effectiveBlocked) {
+    const m = real.match(/^(\/mnt\/[a-z]\/Users\/[^/]+)(\/|$)/i);
+    if (m) wslBases.add(m[1]);
+  }
+  for (const base of wslBases) {
+    for (const dir of DEFAULT_BLOCKED_DIRS) {
+      const derived = path.join(base, dir);
+      if (!effectiveBlocked.some(e => e.abs === derived || e.real === derived)) {
+        effectiveBlocked.push({ label: `${dir} (WSL2-derived)`, abs: derived, real: derived });
+      }
+    }
+  }
+
+  for (const { label, abs, real } of effectiveBlocked) {
+    if (isUnderOrEqual(resolved, abs) || isUnderOrEqual(realResolved, real)) {
+      block(filePath, `path is inside protected directory: ${label}`);
       return 'blocked';
     }
   }
 
-  // Check filename patterns
+  // Check filename patterns (basename-only; symlinks don't change the basename)
   const allBlockedFiles = [...DEFAULT_BLOCKED_FILES, ...extraBlockedFiles.map(p => new RegExp(p, 'i'))];
   for (const pattern of allBlockedFiles) {
     if (pattern.test(basename)) {
